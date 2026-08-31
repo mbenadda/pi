@@ -54,7 +54,7 @@ function resolvePluginExternal(specifier: string): string | undefined {
 	const runtimeModules = process.env.PI_WORKSPACE_RUNTIME_MODULES;
 	if (runtimeModules === undefined) return specifier === PI_PLUGIN_API ? import.meta.resolve(specifier) : undefined;
 	if (specifier === PI_PLUGIN_API) {
-		return join(runtimeModules, "@earendil-works/pi-coding-agent/dist/experimental/plugin.js");
+		return join(runtimeModules, "@earendil-works/pi-coding-agent/plugin.cjs");
 	}
 	const chordEntries: Readonly<Record<string, string>> = {
 		"@earendil-works/chord": "index.js",

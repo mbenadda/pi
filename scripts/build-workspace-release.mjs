@@ -161,23 +161,19 @@ export function buildWorkspaceRelease(options) {
 	return manifest;
 }
 
-function readPluginApiRuntime(repoRoot) {
-	const sourceRoot = join(repoRoot, "packages/coding-agent/dist/experimental");
+function readPluginApiRuntime(_repoRoot) {
+	const source = `"use strict";
+const { defineService } = require("@earendil-works/chord");
+exports.AgentController = defineService("pi.agent-controller");
+exports.PresentationUI = defineService("pi.local.presentation-ui", { local: true });
+exports.SlashCommands = defineService("pi.local.slash-commands", { local: true });
+`;
 	return [
 		{
-			path: "node_modules/@earendil-works/pi-coding-agent/package.json",
-			data: Buffer.from('{"name":"@earendil-works/pi-coding-agent","type":"module"}\n'),
+			path: "node_modules/@earendil-works/pi-coding-agent/plugin.cjs",
+			data: Buffer.from(source),
 			executable: false,
 		},
-		{
-			path: "node_modules/@earendil-works/pi-coding-agent/dist/experimental/plugin.js",
-			data: readFileSync(join(sourceRoot, "plugin.js")),
-			executable: false,
-		},
-		...readTree(
-			join(sourceRoot, "services"),
-			"node_modules/@earendil-works/pi-coding-agent/dist/experimental/services",
-		),
 	];
 }
 
