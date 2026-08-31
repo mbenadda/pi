@@ -543,6 +543,7 @@ export class SessionWorkerManager {
 		if (message.type === "worker_failed") {
 			const pending = this.#pending.get(message.sessionKey);
 			if (pending?.peerId === event.from && pending.token === message.token) {
+				console.error(`Session worker failed: ${message.message}`);
 				this.#failPending(message.sessionKey, new Error(`Session worker failed: ${message.message}`));
 			}
 			return;
