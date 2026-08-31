@@ -7,10 +7,15 @@ import { restoreSandboxEnv } from "./restore-sandbox-env.ts";
 
 restoreSandboxEnv();
 
-if (getInternalProcessRole() === "coordinator") {
+const internalProcessRole = getInternalProcessRole();
+if (internalProcessRole === "coordinator") {
 	consumeInternalProcessRole();
 	await runCoordinatorProcess(process.argv.slice(2));
-} else if (basename(process.execPath) === "pi-workspace-server" && process.argv.slice(2).length === 1) {
+} else if (
+	internalProcessRole === undefined &&
+	basename(process.execPath) === "pi-workspace-server" &&
+	process.argv.slice(2).length === 1
+) {
 	await runWorkspaceSshBridge(process.argv.slice(2));
 } else {
 	await import("./runtime-setup.ts");
