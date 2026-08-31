@@ -66,9 +66,17 @@ export function buildWorkspaceRelease(options) {
 		const binaryPath = realpathSync(resolve(input.binaryPath));
 		if (!statSync(binaryPath).isFile()) throw new Error(`Workspace runtime is not a file: ${binaryPath}`);
 		const entrypoint = "bin/pi-workspace-server";
+		const chordRoot = join(repoRoot, "packages/chord");
 		const archive = createWorkspaceTarGzip([
 			{ path: entrypoint, data: readFileSync(binaryPath), executable: true },
 			...readTree(pluginRoot, "plugins/pi-example-plugin"),
+			{
+				path: "node_modules/@earendil-works/chord/package.json",
+				data: readFileSync(join(chordRoot, "package.json")),
+				executable: false,
+			},
+			...readTree(join(chordRoot, "src"), "node_modules/@earendil-works/chord/src"),
+			...readTree(join(chordRoot, "dist"), "node_modules/@earendil-works/chord/dist"),
 		]);
 		const file = `pi-workspace-server-${input.platform}-${options.revision}.tar.gz`;
 		prepared.push({
