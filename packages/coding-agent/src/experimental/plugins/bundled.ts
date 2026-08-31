@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { combineFacetLoaders, type FacetLoader } from "@earendil-works/chord";
 import {
 	createFacetBundleArtifactLoader,
@@ -50,5 +51,16 @@ export function createPresentationFacetLoaders(data: JsonValue): readonly FacetL
 }
 
 function resolvePluginExternal(specifier: string): string | undefined {
-	return specifier === PI_PLUGIN_API ? import.meta.resolve(specifier) : undefined;
+	if (specifier === PI_PLUGIN_API) return import.meta.resolve(specifier);
+	const runtimeModules = process.env.PI_WORKSPACE_RUNTIME_MODULES;
+	if (runtimeModules === undefined) return undefined;
+	const chordEntries: Readonly<Record<string, string>> = {
+		"@earendil-works/chord": "index.js",
+		"@earendil-works/chord/bundler": "bundler.js",
+		"@earendil-works/chord/context": "context/index.js",
+		"@earendil-works/chord/delta": "delta/index.js",
+		"@earendil-works/chord/node": "node.js",
+	};
+	const entry = chordEntries[specifier];
+	return entry === undefined ? undefined : join(runtimeModules, "@earendil-works/chord/dist", entry);
 }

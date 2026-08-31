@@ -70,24 +70,11 @@ export function buildWorkspaceRelease(options) {
 		if (!existsSync(esbuildPath) || !statSync(esbuildPath).isFile()) {
 			throw new Error(`Workspace server requires a pinned esbuild binary next to its runtime: ${esbuildPath}`);
 		}
-		const chordRoot = join(repoRoot, "packages/chord");
-		const chordPackage = JSON.parse(readFileSync(join(chordRoot, "package.json"), "utf8"));
-		for (const target of Object.values(chordPackage.exports)) {
-			if (typeof target === "object" && target !== null && typeof target.import === "string") {
-				target.require = target.import;
-			}
-		}
 		const archive = createWorkspaceTarGzip([
 			{ path: entrypoint, data: readFileSync(binaryPath), executable: true },
 			{ path: "bin/esbuild", data: readFileSync(esbuildPath), executable: true },
 			...readTree(pluginRoot, "plugins/pi-example-plugin"),
-			{
-				path: "node_modules/@earendil-works/chord/package.json",
-				data: Buffer.from(`${JSON.stringify(chordPackage, undefined, "\t")}\n`),
-				executable: false,
-			},
-			...readTree(join(chordRoot, "src"), "node_modules/@earendil-works/chord/src"),
-			...readTree(join(chordRoot, "dist"), "node_modules/@earendil-works/chord/dist"),
+			...readChordRuntime(repoRoot),
 		]);
 		const file = `pi-workspace-server-${input.platform}-${options.revision}.tar.gz`;
 		prepared.push({
@@ -120,6 +107,7 @@ export function buildWorkspaceRelease(options) {
 		const archive = createWorkspaceTarGzip([
 			{ path: entrypoint, data: readFileSync(binaryPath), executable: true },
 			...clientFiles,
+			...readChordRuntime(repoRoot),
 			{ path: "share/workspace-server/manifest.json", data: Buffer.from(rawServerManifest), executable: false },
 			{
 				path: "share/workspace-server/manifest.sha256",
@@ -169,6 +157,25 @@ export function buildWorkspaceRelease(options) {
 	writeFileSync(join(outDir, "manifest.json"), rawManifest, { mode: 0o600 });
 	writeFileSync(join(outDir, "manifest.sha256"), `${sha256(rawManifest)}  manifest.json\n`, { mode: 0o600 });
 	return manifest;
+}
+
+function readChordRuntime(repoRoot) {
+	const chordRoot = join(repoRoot, "packages/chord");
+	const packageJson = JSON.parse(readFileSync(join(chordRoot, "package.json"), "utf8"));
+	for (const target of Object.values(packageJson.exports)) {
+		if (typeof target === "object" && target !== null && typeof target.import === "string") {
+			target.require = target.import;
+		}
+	}
+	return [
+		{
+			path: "node_modules/@earendil-works/chord/package.json",
+			data: Buffer.from(`${JSON.stringify(packageJson, undefined, "\t")}\n`),
+			executable: false,
+		},
+		...readTree(join(chordRoot, "src"), "node_modules/@earendil-works/chord/src"),
+		...readTree(join(chordRoot, "dist"), "node_modules/@earendil-works/chord/dist"),
+	];
 }
 
 function readTree(root, destination) {

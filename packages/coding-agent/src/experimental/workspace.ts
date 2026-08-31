@@ -346,7 +346,10 @@ export const remoteCommands = {
 		const runtime = options.paths.standalone ? cli : `${node} ${cli}`;
 		const standaloneEnv = options.paths.standalone
 			? ` ESBUILD_BINARY_PATH=${requireValidRemotePath(`${options.paths.revisionDir}/bin/esbuild`, "esbuild path")}` +
-				` NODE_PATH=${requireValidRemotePath(`${options.paths.revisionDir}/node_modules`, "runtime modules path")}`
+				` PI_WORKSPACE_RUNTIME_MODULES=${requireValidRemotePath(
+					`${options.paths.revisionDir}/node_modules`,
+					"runtime modules path",
+				)}`
 			: "";
 		return (
 			`cd ${cwd} && { nohup env PI_EXPERIMENTAL=1 PI_SERVER_DIR=${serverDir}${standaloneEnv} ${runtime} server` +
@@ -752,6 +755,7 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 		toolchain = await resolveRemoteToolchain(host);
 		paths = buildWorkspaceRemotePaths(toolchain.home, repository.revision);
 	} else {
+		process.env.PI_WORKSPACE_RUNTIME_MODULES = join(dirname(getPackageDir()), "node_modules");
 		const [homeResult, platformResult] = await Promise.all([
 			sshExec(host, remoteCommands.probeHome),
 			sshExec(host, remoteCommands.probePlatform),
