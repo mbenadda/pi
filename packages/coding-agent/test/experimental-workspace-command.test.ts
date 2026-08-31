@@ -181,12 +181,12 @@ describe("workspace remote paths and command construction", () => {
 			serverId: SERVER_ID,
 			pluginPackages: [`${HOME}/plugins/example`],
 		});
-		expect(command).toContain("cd /home/bits/go/src/github.com/DataDog/dd-source && nohup env PI_EXPERIMENTAL=1");
+		expect(command).toContain("cd /home/bits/go/src/github.com/DataDog/dd-source && { nohup env PI_EXPERIMENTAL=1");
 		expect(command).toContain("--session-dir /home/bits/.local/state/pi-workspace-mvp/sessions");
 		expect(command).toContain(`--server-id ${SERVER_ID}`);
 		expect(command).toContain("-e /home/bits/plugins/example");
 		expect(command).toContain(">> /home/bits/.local/state/pi-workspace-mvp/server.log 2>&1 < /dev/null &");
-		expect(command).toMatch(/printf %s "\$!" > \S+\/server\.pid$/);
+		expect(command).toMatch(/printf %s "\$!" > \S+\/server\.pid; \}$/);
 	});
 
 	test("rejects unvalidated values in remote command builders", () => {

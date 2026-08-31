@@ -249,10 +249,10 @@ export const remoteCommands = {
 			(packagePath) => `-e ${requireValidRemotePath(packagePath, "plugin package")}`,
 		);
 		return (
-			`cd ${cwd} && nohup env PI_EXPERIMENTAL=1 PI_SERVER_DIR=${serverDir} ${node} ${cli} server` +
+			`cd ${cwd} && { nohup env PI_EXPERIMENTAL=1 PI_SERVER_DIR=${serverDir} ${node} ${cli} server` +
 			` --session-dir ${sessionDir}${serverId.length > 0 ? ` ${serverId.join(" ")}` : ""}` +
 			`${plugins.length > 0 ? ` ${plugins.join(" ")}` : ""}` +
-			` >> ${log} 2>&1 < /dev/null & printf %s "$!" > ${pidFile}`
+			` >> ${log} 2>&1 < /dev/null & printf %s "$!" > ${pidFile}; }`
 		);
 	},
 	stopServer(paths: WorkspaceRemotePaths): string {
