@@ -467,6 +467,9 @@ export class SessionWorkerManager {
 			};
 			child = spawnInternalProcess("session-worker", [JSON.stringify(options)], {
 				env: {
+					// Provider headers and server-side extensions need the durable Pi
+					// identity even though no interactive client process owns this worker.
+					PI_CLIENT_SESSION_ID: metadata.id,
 					[SESSION_WORKER_CONTROL_ADDRESS_ENV]: this.#coordinator.controlPath,
 					[SESSION_WORKER_CONTROL_TOKEN_ENV]: token,
 					[SESSION_WORKER_SESSION_KEY_ENV]: Buffer.from(sessionKey).toString("base64url"),
