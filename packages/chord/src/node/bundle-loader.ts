@@ -17,7 +17,11 @@ import {
 	type FacetBundleManifest,
 } from "./manifest.ts";
 
-export type FacetBundleExternalResolver = (specifier: string) => string | URL | undefined;
+export interface FacetBundleExternalModule {
+	readonly module: unknown;
+}
+
+export type FacetBundleExternalResolver = (specifier: string) => string | URL | FacetBundleExternalModule | undefined;
 
 export interface FacetBundleLoaderOptions {
 	readonly manifestPath: string | URL;
@@ -175,19 +179,30 @@ function executeCommonJsModule(
 	resolver?: FacetBundleExternalResolver,
 ): unknown {
 	const requireFromModule = createRequire(modulePath);
-	const externalTargets = new Map<string, string>();
+	const externalTargets = new Map<string, string | FacetBundleExternalModule>();
 	for (const specifier of externalImports) {
 		if (!isBuiltin(specifier)) validatePackageSpecifier(specifier);
-		externalTargets.set(specifier, toRequireSpecifier(resolveExternalTarget(specifier, resolver)));
+		const target = resolveExternalTarget(specifier, resolver);
+		externalTargets.set(specifier, isExternalModule(target) ? target : toRequireSpecifier(target));
 	}
-	const targetFor = (specifier: string): string => {
+	const targetFor = (specifier: string): string | FacetBundleExternalModule => {
 		const target = externalTargets.get(specifier);
 		if (target === undefined) throw new Error(`Facet bundle required undeclared external import: ${specifier}`);
 		return target;
 	};
-	const requireExternal = Object.assign((specifier: string): unknown => requireFromModule(targetFor(specifier)), {
-		resolve: (specifier: string): string => requireFromModule.resolve(targetFor(specifier)),
-	});
+	const requireExternal = Object.assign(
+		(specifier: string): unknown => {
+			const target = targetFor(specifier);
+			return isExternalModule(target) ? target.module : requireFromModule(target);
+		},
+		{
+			resolve: (specifier: string): string => {
+				const target = targetFor(specifier);
+				if (isExternalModule(target)) throw new Error(`In-memory external has no path: ${specifier}`);
+				return requireFromModule.resolve(target);
+			},
+		},
+	);
 	const commonJsModule: CommonJsModule = { exports: Object.create(null) };
 	const compiled = compileFunction(source, ["exports", "require", "module", "__filename", "__dirname"], {
 		filename: modulePath,
@@ -202,13 +217,18 @@ function executeCommonJsModule(
 	return commonJsModule.exports;
 }
 
-function toRequireSpecifier(target: string): string {
-	if (isAbsolute(target) || isBuiltin(target)) return target;
+function isExternalModule(value: unknown): value is FacetBundleExternalModule {
+	return typeof value === "object" && value !== null && "module" in value;
+}
+
+function toRequireSpecifier(target: string | URL): string {
+	if (typeof target === "string" && (isAbsolute(target) || isBuiltin(target))) return target;
 	let url: URL;
 	try {
 		url = new URL(target);
 	} catch {
-		return target;
+		if (typeof target === "string") return target;
+		throw new Error(`Facet bundle external target is not a valid URL: ${String(target)}`);
 	}
 	if (url.protocol === "file:") return fileURLToPath(url);
 	if (url.protocol === "node:") return url.href;
@@ -322,9 +342,12 @@ async function materializeArtifact(directory: string, artifact: FacetBundleArtif
 	]);
 }
 
-function resolveExternalTarget(specifier: string, resolver?: FacetBundleExternalResolver): string {
+function resolveExternalTarget(
+	specifier: string,
+	resolver?: FacetBundleExternalResolver,
+): string | URL | FacetBundleExternalModule {
 	const resolved = resolver?.(specifier);
-	if (resolved !== undefined) return typeof resolved === "string" ? resolved : resolved.href;
+	if (resolved !== undefined) return resolved;
 	const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
 	if (specifier === "@earendil-works/chord") return new URL(`../index.${extension}`, import.meta.url).href;
 	if (specifier === "@earendil-works/chord/context") {

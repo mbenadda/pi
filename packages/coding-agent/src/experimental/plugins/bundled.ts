@@ -1,5 +1,6 @@
-import { join } from "node:path";
+import * as Chord from "@earendil-works/chord";
 import { combineFacetLoaders, type FacetLoader } from "@earendil-works/chord";
+import * as ChordContext from "@earendil-works/chord/context";
 import {
 	createFacetBundleArtifactLoader,
 	createFacetBundleLoader,
@@ -7,6 +8,7 @@ import {
 	readFacetBundleManifest,
 } from "@earendil-works/chord/node";
 import type { JsonValue } from "@earendil-works/pi-protocol";
+import * as PluginApi from "../plugin.ts";
 
 const PRESENTATION_FACET_BUNDLES_KEY = "presentationFacetBundles";
 const PI_PLUGIN_API = "@earendil-works/pi-coding-agent/experimental/plugin";
@@ -50,19 +52,9 @@ export function createPresentationFacetLoaders(data: JsonValue): readonly FacetL
 	);
 }
 
-function resolvePluginExternal(specifier: string): string | undefined {
-	const runtimeModules = process.env.PI_WORKSPACE_RUNTIME_MODULES;
-	if (runtimeModules === undefined) return specifier === PI_PLUGIN_API ? import.meta.resolve(specifier) : undefined;
-	if (specifier === PI_PLUGIN_API) {
-		return join(runtimeModules, "@earendil-works/pi-coding-agent/plugin.cjs");
-	}
-	const chordEntries: Readonly<Record<string, string>> = {
-		"@earendil-works/chord": "index.js",
-		"@earendil-works/chord/bundler": "bundler.js",
-		"@earendil-works/chord/context": "context/index.js",
-		"@earendil-works/chord/delta": "delta/index.js",
-		"@earendil-works/chord/node": "node.js",
-	};
-	const entry = chordEntries[specifier];
-	return entry === undefined ? undefined : join(runtimeModules, "@earendil-works/chord/dist", entry);
+function resolvePluginExternal(specifier: string): { readonly module: unknown } | undefined {
+	if (specifier === "@earendil-works/chord") return { module: Chord };
+	if (specifier === "@earendil-works/chord/context") return { module: ChordContext };
+	if (specifier === PI_PLUGIN_API) return { module: PluginApi };
+	return undefined;
 }

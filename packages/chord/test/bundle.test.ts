@@ -147,7 +147,11 @@ describe("facet bundles", () => {
 			manifestPath: result.manifestPath,
 			entry: "worker",
 			resolveExternal: (specifier) =>
-				specifier === "@example/host" || specifier === "@example/dynamic" ? pathToFileURL(externalPath) : undefined,
+				specifier === "@example/host"
+					? { module: { named: "host-named" } }
+					: specifier === "@example/dynamic"
+						? pathToFileURL(externalPath)
+						: undefined,
 		}).load();
 		expect(loaded.facets.map(({ id }) => id)).toEqual(["external-facet"]);
 		await loaded.dispose();
