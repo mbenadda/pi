@@ -345,7 +345,8 @@ export const remoteCommands = {
 		);
 		const runtime = options.paths.standalone ? cli : `${node} ${cli}`;
 		const standaloneEnv = options.paths.standalone
-			? ` ESBUILD_BINARY_PATH=${requireValidRemotePath(`${options.paths.revisionDir}/bin/esbuild`, "esbuild path")}`
+			? ` ESBUILD_BINARY_PATH=${requireValidRemotePath(`${options.paths.revisionDir}/bin/esbuild`, "esbuild path")}` +
+				` NODE_PATH=${requireValidRemotePath(`${options.paths.revisionDir}/node_modules`, "runtime modules path")}`
 			: "";
 		return (
 			`cd ${cwd} && { nohup env PI_EXPERIMENTAL=1 PI_SERVER_DIR=${serverDir}${standaloneEnv} ${runtime} server` +
