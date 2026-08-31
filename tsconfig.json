@@ -38,6 +38,7 @@
 			"@earendil-works/pi-protocol/*": ["./packages/protocol/src/*"],
 			"@earendil-works/pi-client": ["./packages/client/src/index.ts"],
 			"@earendil-works/pi-client/unix": ["./packages/client/src/unix.ts"],
+			"@earendil-works/pi-client/ssh": ["./packages/client/src/ssh.ts"],
 			"@earendil-works/pi-client/*": ["./packages/client/src/*"],
 			"@earendil-works/pi-server": ["./packages/server/src/index.ts"],
 			"@earendil-works/pi-server/unix": ["./packages/server/src/transports/unix/index.ts"],
