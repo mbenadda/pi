@@ -138,6 +138,7 @@ describe("experimental workspace command parsing", () => {
 describe("workspace remote paths and command construction", () => {
 	test("builds isolated versioned MVP paths", () => {
 		expect(paths()).toEqual({
+			revision: REVISION,
 			shareRoot: `${HOME}/.local/share/pi-workspace-mvp`,
 			stateRoot: `${HOME}/.local/state/pi-workspace-mvp`,
 			revisionDir: `${HOME}/.local/share/pi-workspace-mvp/${REVISION}`,
@@ -145,6 +146,7 @@ describe("workspace remote paths and command construction", () => {
 			sessionDir: `${HOME}/.local/state/pi-workspace-mvp/sessions`,
 			npmCacheDir: `${HOME}/.local/state/pi-workspace-mvp/npm-cache`,
 			serverPidFile: `${HOME}/.local/state/pi-workspace-mvp/server.pid`,
+			serverRevisionFile: `${HOME}/.local/state/pi-workspace-mvp/server.revision`,
 			serverLogPath: `${HOME}/.local/state/pi-workspace-mvp/server.log`,
 			serverIdFile: `${HOME}/.local/state/pi-workspace-mvp/server/default-server-id`,
 			bridgePath: `${HOME}/.local/share/pi-workspace-mvp/${REVISION}/scripts/workspace-ssh-bridge.mjs`,
@@ -186,7 +188,8 @@ describe("workspace remote paths and command construction", () => {
 		expect(command).toContain(`--server-id ${SERVER_ID}`);
 		expect(command).toContain("-e /home/bits/plugins/example");
 		expect(command).toContain(">> /home/bits/.local/state/pi-workspace-mvp/server.log 2>&1 < /dev/null &");
-		expect(command).toMatch(/printf %s "\$!" > \S+\/server\.pid; \}$/);
+		expect(command).toContain(`printf %s ${REVISION} > ${HOME}/.local/state/pi-workspace-mvp/server.revision`);
+		expect(command).toMatch(/chmod 600 \S+\/server\.pid \S+\/server\.revision; \}$/);
 	});
 
 	test("rejects unvalidated values in remote command builders", () => {
@@ -226,7 +229,8 @@ describe("workspace remote paths and command construction", () => {
 
 	test("builds stop and purge commands that only touch MVP-owned paths", () => {
 		const built = paths();
-		expect(remoteCommands.stopServer(built)).toContain(`grep -qF ${built.revisionDir}`);
+		expect(remoteCommands.stopServer(built)).toContain(`grep -qF ${built.shareRoot}/`);
+		expect(remoteCommands.stopServer(built)).toContain("/packages/coding-agent/dist/bundle/cli.js\\ server");
 		expect(remoteCommands.stopServer(built)).toMatch(/printf %s stopped; else printf %s absent; fi/);
 		expect(remoteCommands.removeStaging(built)).toContain(
 			`if [ -f ${built.markerPath} ]; then rm -rf ${built.revisionDir}`,

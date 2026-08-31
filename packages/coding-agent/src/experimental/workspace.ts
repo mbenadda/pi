@@ -36,6 +36,8 @@ const REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const SSH_ARGS = ["-o", "BatchMode=yes", "-o", "RequestTTY=no", "-o", "ClearAllForwardings=yes"] as const;
 
 export interface WorkspaceRemotePaths {
+	/** Exact Git revision represented by this path set. */
+	readonly revision: string;
 	/** Remote staging root for exact-revision Pi builds. */
 	readonly shareRoot: string;
 	/** Remote runtime state root owned by this MVP. */
@@ -46,6 +48,7 @@ export interface WorkspaceRemotePaths {
 	readonly sessionDir: string;
 	readonly npmCacheDir: string;
 	readonly serverPidFile: string;
+	readonly serverRevisionFile: string;
 	readonly serverLogPath: string;
 	readonly serverIdFile: string;
 	readonly bridgePath: string;
@@ -75,6 +78,7 @@ export function buildWorkspaceRemotePaths(home: string, revision: string): Works
 	const revisionDir = `${shareRoot}/${revision}`;
 	const serverDir = `${stateRoot}/server`;
 	return {
+		revision,
 		shareRoot,
 		stateRoot,
 		revisionDir,
@@ -82,6 +86,7 @@ export function buildWorkspaceRemotePaths(home: string, revision: string): Works
 		sessionDir: `${stateRoot}/sessions`,
 		npmCacheDir: `${stateRoot}/npm-cache`,
 		serverPidFile: `${stateRoot}/server.pid`,
+		serverRevisionFile: `${stateRoot}/server.revision`,
 		serverLogPath: `${stateRoot}/server.log`,
 		serverIdFile: `${serverDir}/default-server-id`,
 		bridgePath: `${revisionDir}/scripts/workspace-ssh-bridge.mjs`,
@@ -227,6 +232,9 @@ export const remoteCommands = {
 	readServerId(paths: WorkspaceRemotePaths): string {
 		return `cat ${requireValidRemotePath(paths.serverIdFile, "server identity file")}`;
 	},
+	readServerRevision(paths: WorkspaceRemotePaths): string {
+		return `cat ${requireValidRemotePath(paths.serverRevisionFile, "server revision file")}`;
+	},
 	hasSocket(socketPath: string): string {
 		return `test -S ${requireValidRemotePath(socketPath, "server socket")}`;
 	},
@@ -244,6 +252,9 @@ export const remoteCommands = {
 		const cli = requireValidRemotePath(options.paths.cliEntry, "server entrypoint");
 		const log = requireValidRemotePath(options.paths.serverLogPath, "server log");
 		const pidFile = requireValidRemotePath(options.paths.serverPidFile, "server pid file");
+		const revisionFile = requireValidRemotePath(options.paths.serverRevisionFile, "server revision file");
+		const revision = options.paths.revision;
+		if (!REVISION_PATTERN.test(revision)) throw new Error(`Invalid revision: ${JSON.stringify(revision)}`);
 		const serverId = options.serverId === undefined ? [] : ["--server-id", requireValidServerId(options.serverId)];
 		const plugins = options.pluginPackages.map(
 			(packagePath) => `-e ${requireValidRemotePath(packagePath, "plugin package")}`,
@@ -252,17 +263,20 @@ export const remoteCommands = {
 			`cd ${cwd} && { nohup env PI_EXPERIMENTAL=1 PI_SERVER_DIR=${serverDir} ${node} ${cli} server` +
 			` --session-dir ${sessionDir}${serverId.length > 0 ? ` ${serverId.join(" ")}` : ""}` +
 			`${plugins.length > 0 ? ` ${plugins.join(" ")}` : ""}` +
-			` >> ${log} 2>&1 < /dev/null & printf %s "$!" > ${pidFile}; }`
+			` >> ${log} 2>&1 < /dev/null & printf %s "$!" > ${pidFile}; printf %s ${revision} > ${revisionFile};` +
+			` chmod 600 ${pidFile} ${revisionFile}; }`
 		);
 	},
 	stopServer(paths: WorkspaceRemotePaths): string {
 		const pidFile = requireValidRemotePath(paths.serverPidFile, "server pid file");
-		const revisionDir = requireValidRemotePath(paths.revisionDir, "staging directory");
+		const revisionFile = requireValidRemotePath(paths.serverRevisionFile, "server revision file");
+		const shareRoot = requireValidRemotePath(paths.shareRoot, "staging root");
 		return (
-			`pid=$(cat ${pidFile} 2>/dev/null || true)` +
-			`; if [ -n "$pid" ] && tr "\\0" " " < /proc/$pid/cmdline 2>/dev/null | grep -qF ${revisionDir}` +
+			`pid=$(cat ${pidFile} 2>/dev/null || true); cmd=$(tr "\\0" " " < /proc/$pid/cmdline 2>/dev/null || true)` +
+			`; if [ -n "$pid" ] && printf %s "$cmd" | grep -qF ${shareRoot}/` +
+			` && printf %s "$cmd" | grep -qF /packages/coding-agent/dist/bundle/cli.js\\ server` +
 			`; then kill -TERM "$pid"; printf %s stopped; else printf %s absent; fi` +
-			`; rm -f ${pidFile}`
+			`; rm -f ${pidFile} ${revisionFile}`
 		);
 	},
 	removeStaging(paths: WorkspaceRemotePaths): string {
@@ -459,6 +473,13 @@ async function readRemoteServerId(host: string, paths: WorkspaceRemotePaths): Pr
 	return requireValidServerId(serverId);
 }
 
+async function readRemoteServerRevision(host: string, paths: WorkspaceRemotePaths): Promise<string | undefined> {
+	const result = await sshExec(host, remoteCommands.readServerRevision(paths));
+	if (result.code !== 0) return undefined;
+	const revision = result.stdout.trim();
+	return REVISION_PATTERN.test(revision) ? revision : undefined;
+}
+
 async function startRemoteServer(
 	host: string,
 	paths: WorkspaceRemotePaths,
@@ -495,7 +516,9 @@ async function ensureRemoteServer(
 	if (existing !== undefined) {
 		const socketPath = serverSocketPath(paths, existing);
 		const socket = await sshExec(host, remoteCommands.hasSocket(socketPath));
+		const runningRevision = await readRemoteServerRevision(host, paths);
 		if (
+			runningRevision === paths.revision &&
 			socket.code === 0 &&
 			(await probeRemoteServer(
 				{ serverId: existing, socketPath, bridgePath: paths.bridgePath, nodePath: toolchain.nodePath },
@@ -503,6 +526,16 @@ async function ensureRemoteServer(
 			))
 		) {
 			return existing;
+		}
+		if (runningRevision !== undefined && runningRevision !== paths.revision) {
+			console.log(`Replacing Workspace server revision ${runningRevision} with ${paths.revision}…`);
+			const stopped = await sshExec(host, remoteCommands.stopServer(paths));
+			if (!stopped.stdout.includes("stopped")) throw new Error("Refused to stop the previous MVP server revision");
+			const deadline = Date.now() + SERVER_STOP_TIMEOUT_MS;
+			while (Date.now() < deadline) {
+				if ((await sshExec(host, remoteCommands.hasSocket(socketPath))).code !== 0) break;
+				await new Promise<void>((resolve) => setTimeout(resolve, POLL_MS));
+			}
 		}
 	}
 	console.log("Starting the persistent Workspace server…");
@@ -616,7 +649,10 @@ async function reportWorkspaceStatus(
 				{ serverId, socketPath, bridgePath: paths.bridgePath, nodePath: toolchain.nodePath },
 				host,
 			));
-		console.log(`Server:          ${serverId} (${alive ? "reachable" : "stopped"})`);
+		const runningRevision = await readRemoteServerRevision(host, paths);
+		console.log(
+			`Server:          ${serverId} (${alive ? "reachable" : "stopped"}; revision ${runningRevision ?? "unknown"})`,
+		);
 	}
 	const state = await readWorkspaceLocalState(host, command.remoteCwd);
 	console.log(`Local session:   ${state === undefined ? "none" : state.sessionId}`);
