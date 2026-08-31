@@ -165,6 +165,11 @@ function readPluginApiRuntime(repoRoot) {
 	const sourceRoot = join(repoRoot, "packages/coding-agent/dist/experimental");
 	return [
 		{
+			path: "node_modules/@earendil-works/pi-coding-agent/package.json",
+			data: Buffer.from('{"name":"@earendil-works/pi-coding-agent","type":"module"}\n'),
+			executable: false,
+		},
+		{
 			path: "node_modules/@earendil-works/pi-coding-agent/dist/experimental/plugin.js",
 			data: readFileSync(join(sourceRoot, "plugin.js")),
 			executable: false,
