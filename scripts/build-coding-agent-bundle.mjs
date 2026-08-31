@@ -19,6 +19,7 @@ const allowedExternalPackages = new Set([
 	"@earendil-works/chord",
 	"@earendil-works/chord/bundler",
 	"@earendil-works/chord/context",
+	"@earendil-works/chord/delta",
 	"@earendil-works/chord/node",
 	"@silvia-odwyer/photon-node",
 	"jiti",
