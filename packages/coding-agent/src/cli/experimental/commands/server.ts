@@ -5,6 +5,7 @@ import {
 	authTokenFileOption,
 	authTokenOption,
 	parseAuth,
+	parseRemoteWorkspacePath,
 	unsupportedOptions,
 } from "../command-options.ts";
 
@@ -16,6 +17,8 @@ export interface ServerCommand {
 	readonly pluginPackages?: readonly string[];
 	readonly serverId?: ServerId;
 	readonly sessionDir?: string;
+	readonly readyFile?: string;
+	readonly generation?: string;
 }
 
 export interface ServerCommandContext {
@@ -28,6 +31,16 @@ const serverIdOption = valueOption("--server-id", (value) =>
 		: { ok: false, error: `Invalid --server-id "${value}"; expected a lowercase UUIDv4` },
 );
 const sessionDirOption = stringOption("--session-dir");
+const readyFileOption = valueOption("--ready-file", (value) => {
+	const result = parseRemoteWorkspacePath(value, "server readiness file");
+	return result.path
+		? { ok: true, value: result.path }
+		: { ok: false, error: result.error ?? `Invalid server readiness file "${value}"` };
+});
+const GENERATION_PATTERN = /^[0-9a-f]{40}:[0-9a-f-]{36}$/u;
+const generationOption = valueOption("--generation", (value) =>
+	GENERATION_PATTERN.test(value) ? { ok: true, value } : { ok: false, error: `Invalid --generation "${value}"` },
+);
 const providerOption = stringOption("--provider");
 const modelOption = stringOption("--model");
 const pluginPackageOption = stringOption("-e", { repeatable: true });
@@ -35,6 +48,8 @@ const pluginPackageOption = stringOption("-e", { repeatable: true });
 export const serverCommand = new Command<ServerCommand, ServerCommandContext>("server")
 	.option(serverIdOption)
 	.option(sessionDirOption)
+	.option(readyFileOption)
+	.option(generationOption)
 	.option(providerOption)
 	.option(modelOption)
 	.option(pluginPackageOption)
@@ -44,11 +59,17 @@ export const serverCommand = new Command<ServerCommand, ServerCommandContext>("s
 		const { auth, errors: authErrors } = parseAuth(input);
 		const serverId = input.value(serverIdOption);
 		const sessionDir = input.value(sessionDirOption);
+		const readyFile = input.value(readyFileOption);
+		const generation = input.value(generationOption);
 		const provider = input.value(providerOption);
 		const model = input.value(modelOption);
 		const pluginPackages = input.values(pluginPackageOption);
 		const modelErrors = provider !== undefined && model === undefined ? ["--provider requires --model"] : [];
-		const errors = [...authErrors, ...modelErrors, ...unsupportedOptions("server", input)];
+		const readinessErrors =
+			(readyFile === undefined) === (generation === undefined)
+				? []
+				: ["--ready-file and --generation must be provided together"];
+		const errors = [...authErrors, ...modelErrors, ...readinessErrors, ...unsupportedOptions("server", input)];
 		if (errors.length > 0) return { ok: false, errors };
 		return {
 			ok: true,
@@ -60,6 +81,8 @@ export const serverCommand = new Command<ServerCommand, ServerCommandContext>("s
 				...(pluginPackages.length === 0 ? {} : { pluginPackages }),
 				...(serverId === undefined ? {} : { serverId }),
 				...(sessionDir === undefined ? {} : { sessionDir }),
+				...(readyFile === undefined ? {} : { readyFile }),
+				...(generation === undefined ? {} : { generation }),
 			},
 		};
 	})

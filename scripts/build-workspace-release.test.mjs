@@ -77,6 +77,9 @@ test("builds deterministic checksummed client and server Workspace artifacts", a
 			if (artifact.role === "server") {
 				assert.ok(entries.some((entry) => entry.path === "plugins/pi-example-plugin/src/session.ts"));
 				assert.ok(entries.some((entry) => entry.path === "plugins/pi-example-plugin/src/tui.ts"));
+			} else {
+				assert.ok(entries.some((entry) => entry.path === "share/workspace-server/manifest.json"));
+				assert.ok(entries.some((entry) => entry.path === `share/workspace-server/${first.artifacts[1].file}`));
 			}
 		}
 

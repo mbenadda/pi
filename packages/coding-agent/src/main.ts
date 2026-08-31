@@ -5,6 +5,7 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
@@ -614,11 +615,14 @@ async function runExperimentalServerCommand(command: ServerCommand): Promise<voi
 			else pendingRelayStatus = status;
 		},
 	});
-	console.log(`Server: ${runtime.serverId}`);
-	console.log(`Socket: ${runtime.socketPath}`);
-	relayOutputReady = true;
-	if (pendingRelayStatus !== undefined) reportRelayStatus(pendingRelayStatus);
 	try {
+		if (command.readyFile !== undefined && command.generation !== undefined) {
+			await writeFile(command.readyFile, `${command.generation}\n`, { encoding: "utf8", mode: 0o600 });
+		}
+		console.log(`Server: ${runtime.serverId}`);
+		console.log(`Socket: ${runtime.socketPath}`);
+		relayOutputReady = true;
+		if (pendingRelayStatus !== undefined) reportRelayStatus(pendingRelayStatus);
 		await waitForTermination(runtime.closed);
 	} finally {
 		await runtime.close();

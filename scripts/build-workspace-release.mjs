@@ -46,48 +46,103 @@ export function createWorkspaceTarGzip(files) {
 export function buildWorkspaceRelease(options) {
 	if (!REVISION_PATTERN.test(options.revision)) throw new Error(`Invalid revision: ${options.revision}`);
 	if (options.inputs.length === 0) throw new Error("At least one --client or --server binary is required");
+	const inputs = [...options.inputs].sort(
+		(left, right) => left.role.localeCompare(right.role) || left.platform.localeCompare(right.platform),
+	);
+	const seen = new Set();
+	for (const input of inputs) {
+		if (!PLATFORM_PATTERN.test(input.platform)) throw new Error(`Invalid platform: ${input.platform}`);
+		const key = `${input.role}:${input.platform}`;
+		if (seen.has(key)) throw new Error(`Duplicate artifact input: ${key}`);
+		seen.add(key);
+	}
+	if (inputs.some((input) => input.role === "client") && !inputs.some((input) => input.role === "server")) {
+		throw new Error("A client artifact requires at least one server artifact");
+	}
+	const repoRoot = resolve(options.repoRoot);
+	const pluginRoot = join(repoRoot, DEFAULT_PLUGIN_DIRECTORY);
+	const prepared = [];
+	for (const input of inputs.filter((candidate) => candidate.role === "server")) {
+		const binaryPath = realpathSync(resolve(input.binaryPath));
+		if (!statSync(binaryPath).isFile()) throw new Error(`Workspace runtime is not a file: ${binaryPath}`);
+		const entrypoint = "bin/pi-workspace-server";
+		const archive = createWorkspaceTarGzip([
+			{ path: entrypoint, data: readFileSync(binaryPath), executable: true },
+			...readTree(pluginRoot, "plugins/pi-example-plugin"),
+		]);
+		const file = `pi-workspace-server-${input.platform}-${options.revision}.tar.gz`;
+		prepared.push({
+			archive,
+			artifact: {
+				role: "server",
+				platform: input.platform,
+				file,
+				sha256: sha256(archive),
+				size: archive.length,
+				entrypoint,
+			},
+		});
+	}
+	const serverArtifacts = prepared.map(({ artifact }) => artifact);
+	const serverManifest = {
+		schemaVersion: 1,
+		revision: options.revision,
+		protocolVersion: PROTOCOL_VERSION,
+		artifacts: serverArtifacts,
+	};
+	const rawServerManifest = `${JSON.stringify(serverManifest, undefined, "\t")}\n`;
+	for (const input of inputs.filter((candidate) => candidate.role === "client")) {
+		const binaryPath = realpathSync(resolve(input.binaryPath));
+		if (!statSync(binaryPath).isFile()) throw new Error(`Workspace runtime is not a file: ${binaryPath}`);
+		const entrypoint = "bin/piw";
+		const archive = createWorkspaceTarGzip([
+			{ path: entrypoint, data: readFileSync(binaryPath), executable: true },
+			{ path: "share/workspace-server/manifest.json", data: Buffer.from(rawServerManifest), executable: false },
+			{
+				path: "share/workspace-server/manifest.sha256",
+				data: Buffer.from(`${sha256(rawServerManifest)}  manifest.json\n`),
+				executable: false,
+			},
+			...prepared
+				.filter(({ artifact }) => artifact.role === "server")
+				.map(({ archive: serverArchive, artifact }) => ({
+					path: `share/workspace-server/${artifact.file}`,
+					data: serverArchive,
+					executable: false,
+				})),
+		]);
+		const file = `pi-workspace-client-${input.platform}-${options.revision}.tar.gz`;
+		prepared.push({
+			archive,
+			artifact: {
+				role: "client",
+				platform: input.platform,
+				file,
+				sha256: sha256(archive),
+				size: archive.length,
+				entrypoint,
+			},
+		});
+	}
+	prepared.sort(
+		(left, right) =>
+			left.artifact.role.localeCompare(right.artifact.role) ||
+			left.artifact.platform.localeCompare(right.artifact.platform),
+	);
+	const manifest = {
+		schemaVersion: 1,
+		revision: options.revision,
+		protocolVersion: PROTOCOL_VERSION,
+		artifacts: prepared.map(({ artifact }) => artifact),
+	};
+	const rawManifest = `${JSON.stringify(manifest, undefined, "\t")}\n`;
 	const outDir = resolve(options.outDir);
 	if (existsSync(outDir)) {
 		if (!options.force) throw new Error(`Output directory already exists: ${outDir}`);
 		rmSync(outDir, { recursive: true, force: true });
 	}
 	mkdirSync(outDir, { recursive: true, mode: 0o700 });
-	const repoRoot = resolve(options.repoRoot);
-	const pluginRoot = join(repoRoot, DEFAULT_PLUGIN_DIRECTORY);
-	const artifacts = [];
-	const seen = new Set();
-	for (const input of [...options.inputs].sort(
-		(left, right) => left.role.localeCompare(right.role) || left.platform.localeCompare(right.platform),
-	)) {
-		if (!PLATFORM_PATTERN.test(input.platform)) throw new Error(`Invalid platform: ${input.platform}`);
-		const key = `${input.role}:${input.platform}`;
-		if (seen.has(key)) throw new Error(`Duplicate artifact input: ${key}`);
-		seen.add(key);
-		const binaryPath = realpathSync(resolve(input.binaryPath));
-		const binaryStats = statSync(binaryPath);
-		if (!binaryStats.isFile()) throw new Error(`Workspace runtime is not a file: ${binaryPath}`);
-		const entrypoint = input.role === "client" ? "bin/piw" : "bin/pi-workspace-server";
-		const files = [{ path: entrypoint, data: readFileSync(binaryPath), executable: true }];
-		if (input.role === "server") files.push(...readTree(pluginRoot, "plugins/pi-example-plugin"));
-		const archive = createWorkspaceTarGzip(files);
-		const file = `pi-workspace-${input.role}-${input.platform}-${options.revision}.tar.gz`;
-		writeFileSync(join(outDir, file), archive, { mode: 0o600 });
-		artifacts.push({
-			role: input.role,
-			platform: input.platform,
-			file,
-			sha256: sha256(archive),
-			size: archive.length,
-			entrypoint,
-		});
-	}
-	const manifest = {
-		schemaVersion: 1,
-		revision: options.revision,
-		protocolVersion: PROTOCOL_VERSION,
-		artifacts,
-	};
-	const rawManifest = `${JSON.stringify(manifest, undefined, "\t")}\n`;
+	for (const { archive, artifact } of prepared) writeFileSync(join(outDir, artifact.file), archive, { mode: 0o600 });
 	writeFileSync(join(outDir, "manifest.json"), rawManifest, { mode: 0o600 });
 	writeFileSync(join(outDir, "manifest.sha256"), `${sha256(rawManifest)}  manifest.json\n`, { mode: 0o600 });
 	return manifest;

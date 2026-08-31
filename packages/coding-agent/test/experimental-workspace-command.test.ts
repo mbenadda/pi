@@ -3,17 +3,20 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { cli } from "../src/cli/experimental/cli.ts";
 import {
+	buildInstalledWorkspaceRemotePaths,
 	buildWorkspaceRemotePaths,
 	readWorkspaceLocalState,
 	remoteCommands,
 	requireValidRemotePath,
 	serverSocketPath,
+	waitForWorkspaceGeneration,
 	writeWorkspaceLocalState,
 } from "../src/experimental/workspace.ts";
 
 const HOME = "/home/bits";
 const REVISION = "0123456789abcdef0123456789abcdef01234567";
 const SERVER_ID = "00000000-0000-4000-8000-000000000001";
+const GENERATION = `${REVISION}:00000000-0000-4000-8000-000000000003`;
 const REMOTE_CWD = "/home/bits/go/src/github.com/DataDog/dd-source";
 
 function paths() {
@@ -152,6 +155,19 @@ describe("workspace remote paths and command construction", () => {
 			bridgePath: `${HOME}/.local/share/pi-workspace-mvp/${REVISION}/scripts/workspace-ssh-bridge.mjs`,
 			cliEntry: `${HOME}/.local/share/pi-workspace-mvp/${REVISION}/packages/coding-agent/dist/bundle/cli.js`,
 			markerPath: `${HOME}/.local/share/pi-workspace-mvp/${REVISION}/.pi-workspace-staged`,
+			standalone: false,
+		});
+	});
+
+	test("builds content-addressed standalone backend paths", () => {
+		const digest = "a".repeat(64);
+		expect(buildInstalledWorkspaceRemotePaths(HOME, REVISION, digest)).toMatchObject({
+			shareRoot: `${HOME}/.local/share/pi-workspace-server`,
+			stateRoot: `${HOME}/.local/state/pi-workspace-server`,
+			revisionDir: `${HOME}/.local/share/pi-workspace-server/releases/${digest}`,
+			bridgePath: "--workspace-ssh-bridge",
+			cliEntry: `${HOME}/.local/share/pi-workspace-server/releases/${digest}/bin/pi-workspace-server`,
+			standalone: true,
 		});
 	});
 
@@ -182,14 +198,18 @@ describe("workspace remote paths and command construction", () => {
 			remoteCwd: REMOTE_CWD,
 			serverId: SERVER_ID,
 			pluginPackages: [`${HOME}/plugins/example`],
+			generation: GENERATION,
 		});
 		expect(command).toContain("cd /home/bits/go/src/github.com/DataDog/dd-source && { nohup env PI_EXPERIMENTAL=1");
 		expect(command).toContain("--session-dir /home/bits/.local/state/pi-workspace-mvp/sessions");
 		expect(command).toContain(`--server-id ${SERVER_ID}`);
 		expect(command).toContain("-e /home/bits/plugins/example");
+		expect(command).toContain(
+			`--ready-file ${HOME}/.local/state/pi-workspace-mvp/server.revision --generation ${GENERATION}`,
+		);
 		expect(command).toContain(">> /home/bits/.local/state/pi-workspace-mvp/server.log 2>&1 < /dev/null &");
-		expect(command).toContain(`printf %s ${REVISION} > ${HOME}/.local/state/pi-workspace-mvp/server.revision`);
-		expect(command).toMatch(/chmod 600 \S+\/server\.pid \S+\/server\.revision; \}$/);
+		expect(command).not.toContain(`printf %s ${REVISION}`);
+		expect(command).toMatch(/chmod 600 \S+\/server\.pid; \}$/);
 	});
 
 	test("rejects unvalidated values in remote command builders", () => {
@@ -205,6 +225,7 @@ describe("workspace remote paths and command construction", () => {
 				toolchain,
 				remoteCwd: "not/absolute",
 				pluginPackages: [],
+				generation: GENERATION,
 			}),
 		).toThrow(/Invalid remote working directory/);
 		expect(() =>
@@ -214,6 +235,7 @@ describe("workspace remote paths and command construction", () => {
 				remoteCwd: REMOTE_CWD,
 				serverId: "not-a-server-id",
 				pluginPackages: [],
+				generation: GENERATION,
 			}),
 		).toThrow(/Invalid remote server identity/);
 		expect(() =>
@@ -222,6 +244,7 @@ describe("workspace remote paths and command construction", () => {
 				toolchain,
 				remoteCwd: REMOTE_CWD,
 				pluginPackages: ["; rm -rf /"],
+				generation: GENERATION,
 			}),
 		).toThrow(/Invalid plugin package/);
 		expect(() => remoteCommands.writeMarker(paths(), "not-a-revision")).toThrow(/Invalid revision/);
@@ -235,6 +258,54 @@ describe("workspace remote paths and command construction", () => {
 		expect(remoteCommands.removeStaging(built)).toContain(
 			`if [ -f ${built.markerPath} ]; then rm -rf ${built.revisionDir}`,
 		);
+	});
+});
+
+describe("workspace exact generation readiness", () => {
+	test("does not probe the old coordinator generation before first attach", async () => {
+		const expected = GENERATION;
+		const old = `${REVISION}:00000000-0000-4000-8000-000000000099`;
+		const generations = [old, old, expected];
+		const probes: string[] = [];
+		let iteration = 0;
+		let clock = 0;
+		const serverId = await waitForWorkspaceGeneration(expected, 10_000, {
+			readServerId: async () => SERVER_ID,
+			readGeneration: async () => generations[Math.min(iteration++, generations.length - 1)],
+			hasSocket: async (candidate) => candidate === SERVER_ID,
+			probe: async (candidate) => {
+				probes.push(candidate);
+				return true;
+			},
+			now: () => clock,
+			sleep: async (delayMs) => {
+				clock += delayMs;
+			},
+		});
+		expect(serverId).toBe(SERVER_ID);
+		expect(probes).toEqual([SERVER_ID]);
+		expect(iteration).toBe(3);
+	});
+
+	test("times out on a different exact generation without probing generic socket liveness", async () => {
+		let clock = 0;
+		let probes = 0;
+		await expect(
+			waitForWorkspaceGeneration(GENERATION, 1_000, {
+				readServerId: async () => SERVER_ID,
+				readGeneration: async () => `${REVISION}:00000000-0000-4000-8000-000000000099`,
+				hasSocket: async () => true,
+				probe: async () => {
+					probes += 1;
+					return true;
+				},
+				now: () => clock,
+				sleep: async (delayMs) => {
+					clock += delayMs;
+				},
+			}),
+		).rejects.toThrow(/exact Workspace server generation/);
+		expect(probes).toBe(0);
 	});
 });
 

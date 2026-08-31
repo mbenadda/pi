@@ -1,6 +1,8 @@
 #!/usr/bin/env node
+import { basename } from "node:path";
 import { APP_NAME } from "./config.ts";
 import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
+import { runPiw } from "./experimental/piw.ts";
 import { consumeInternalProcessRole } from "./experimental/process.ts";
 import { runServerProcess } from "./experimental/server.ts";
 import { runSessionWorkerProcess } from "./experimental/session-worker.ts";
@@ -24,5 +26,6 @@ if (internalProcessRole === "server") {
 	// Runtime settings are applied once SettingsManager has loaded global/project settings.
 	configureHttpDispatcher();
 
-	main(process.argv.slice(2));
+	if (basename(process.argv[1] ?? process.execPath) === "piw") void runPiw(process.argv.slice(2));
+	else main(process.argv.slice(2));
 }

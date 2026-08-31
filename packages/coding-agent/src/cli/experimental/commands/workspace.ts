@@ -4,14 +4,16 @@ import { parseRemoteWorkspacePath, unsupportedOptions } from "../command-options
 
 export interface WorkspaceCommand {
 	readonly command: "workspace";
+	readonly workspaceName?: string;
 	readonly sshHost: string;
-	readonly remoteCwd: string;
+	readonly remoteCwd?: string;
 	readonly sessionId?: string;
 	readonly newSession?: boolean;
 	readonly pluginPackages?: readonly string[];
 	readonly status?: boolean;
 	readonly cleanup?: boolean;
 	readonly purge?: boolean;
+	readonly update?: boolean;
 }
 
 export interface WorkspaceCommandContext {
