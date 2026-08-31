@@ -11,7 +11,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { PROTOCOL_VERSION } from "@earendil-works/pi-protocol";
@@ -95,8 +95,12 @@ export function buildWorkspaceRelease(options) {
 		const binaryPath = realpathSync(resolve(input.binaryPath));
 		if (!statSync(binaryPath).isFile()) throw new Error(`Workspace runtime is not a file: ${binaryPath}`);
 		const entrypoint = "bin/piw";
+		const clientFiles = readTree(dirname(binaryPath), "bin").filter(
+			(file) => file.path !== `bin/${basename(binaryPath)}`,
+		);
 		const archive = createWorkspaceTarGzip([
 			{ path: entrypoint, data: readFileSync(binaryPath), executable: true },
+			...clientFiles,
 			{ path: "share/workspace-server/manifest.json", data: Buffer.from(rawServerManifest), executable: false },
 			{
 				path: "share/workspace-server/manifest.sha256",

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -35,8 +35,9 @@ function readString(buffer, offset, length) {
 test("builds deterministic checksummed client and server Workspace artifacts", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-workspace-release-test-"));
 	try {
-		const clientBinary = join(root, "client");
-		const serverBinary = join(root, "server");
+		const clientBinary = join(root, "client-build", "pi");
+		const serverBinary = join(root, "server-build", "pi");
+		await Promise.all([mkdir(join(root, "client-build")), mkdir(join(root, "server-build"))]);
 		await writeFile(clientBinary, "client-runtime");
 		await writeFile(serverBinary, "server-runtime");
 		const inputs = [

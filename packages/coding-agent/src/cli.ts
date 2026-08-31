@@ -26,6 +26,9 @@ if (internalProcessRole === "server") {
 	// Runtime settings are applied once SettingsManager has loaded global/project settings.
 	configureHttpDispatcher();
 
-	if (basename(process.argv[1] ?? process.execPath) === "piw") void runPiw(process.argv.slice(2));
-	else main(process.argv.slice(2));
+	if (basename(process.execPath) === "piw" || basename(process.argv[1] ?? "") === "piw") {
+		void runPiw(process.argv.slice(2));
+	} else {
+		main(process.argv.slice(2));
+	}
 }
