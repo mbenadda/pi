@@ -610,7 +610,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
 		const socketPath = getUnixSocketPath(serverId, directory);
 		const controlPath = join(directory, `control-${serverId}.sock`);
 		const serverNonce = randomUUID().replaceAll("-", "").slice(0, 12);
-		const serverPath = join(directory, `server-${serverId}-${serverNonce}.sock`);
+		// The coordinator already scopes this generation to serverId. Keep the
+		// private route short enough for Unix sockaddr limits in nested state roots.
+		const serverPath = join(directory, `server-${serverNonce}.sock`);
 		startupLease = await ensureCoordinator(socketPath, controlPath);
 		coordinator = new CoordinatorConnection({ controlPath, endpoint: serverPath });
 		const sessionDir = resolveSessionDirectory(options.sessionDir);

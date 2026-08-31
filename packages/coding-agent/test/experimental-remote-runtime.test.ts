@@ -103,8 +103,24 @@ describe("experimental durable server composition", () => {
 		expect(entries.every((entry) => !entry.startsWith("."))).toBe(true);
 		expect(entries).toContain(`${serverId}.sock`);
 		expect(entries).toContain(`control-${serverId}.sock`);
-		expect(entries).toContainEqual(expect.stringMatching(new RegExp(`^server-${serverId}-[0-9a-f]{12}\\.sock$`)));
+		expect(entries).toContainEqual(expect.stringMatching(/^server-[0-9a-f]{12}\.sock$/));
 		await expect(runClient({ command: "client" })).resolves.toMatchObject({
+			kind: "list",
+			sessions: [{ sessionId: "demo-1" }, { sessionId: "demo-2" }],
+		});
+	});
+
+	test("keeps the coordinator backend route below Unix socket path limits", async () => {
+		const parent = await mkdtemp(join("/tmp", "pi-long-server-directory-"));
+		const directory = join(parent, "nested-root");
+		directories.add(parent);
+		const runtime = await startServer({ ...sessionWorkerModel, directory });
+		servers.add(runtime);
+
+		const backendRoute = (await readdir(directory)).find((entry) => /^server-[0-9a-f]{12}\.sock$/.test(entry));
+		expect(backendRoute).toBeDefined();
+		expect(join(directory, backendRoute!).length).toBeLessThan(104);
+		await expect(runClient({ command: "client" }, { directory })).resolves.toMatchObject({
 			kind: "list",
 			sessions: [{ sessionId: "demo-1" }, { sessionId: "demo-2" }],
 		});
