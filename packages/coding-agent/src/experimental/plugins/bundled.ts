@@ -51,9 +51,11 @@ export function createPresentationFacetLoaders(data: JsonValue): readonly FacetL
 }
 
 function resolvePluginExternal(specifier: string): string | undefined {
-	if (specifier === PI_PLUGIN_API) return import.meta.resolve(specifier);
 	const runtimeModules = process.env.PI_WORKSPACE_RUNTIME_MODULES;
-	if (runtimeModules === undefined) return undefined;
+	if (runtimeModules === undefined) return specifier === PI_PLUGIN_API ? import.meta.resolve(specifier) : undefined;
+	if (specifier === PI_PLUGIN_API) {
+		return join(runtimeModules, "@earendil-works/pi-coding-agent/dist/experimental/plugin.js");
+	}
 	const chordEntries: Readonly<Record<string, string>> = {
 		"@earendil-works/chord": "index.js",
 		"@earendil-works/chord/bundler": "bundler.js",

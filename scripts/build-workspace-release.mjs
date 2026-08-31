@@ -75,6 +75,7 @@ export function buildWorkspaceRelease(options) {
 			{ path: "bin/esbuild", data: readFileSync(esbuildPath), executable: true },
 			...readTree(pluginRoot, "plugins/pi-example-plugin"),
 			...readChordRuntime(repoRoot),
+			...readPluginApiRuntime(repoRoot),
 		]);
 		const file = `pi-workspace-server-${input.platform}-${options.revision}.tar.gz`;
 		prepared.push({
@@ -108,6 +109,7 @@ export function buildWorkspaceRelease(options) {
 			{ path: entrypoint, data: readFileSync(binaryPath), executable: true },
 			...clientFiles,
 			...readChordRuntime(repoRoot),
+			...readPluginApiRuntime(repoRoot),
 			{ path: "share/workspace-server/manifest.json", data: Buffer.from(rawServerManifest), executable: false },
 			{
 				path: "share/workspace-server/manifest.sha256",
@@ -157,6 +159,21 @@ export function buildWorkspaceRelease(options) {
 	writeFileSync(join(outDir, "manifest.json"), rawManifest, { mode: 0o600 });
 	writeFileSync(join(outDir, "manifest.sha256"), `${sha256(rawManifest)}  manifest.json\n`, { mode: 0o600 });
 	return manifest;
+}
+
+function readPluginApiRuntime(repoRoot) {
+	const sourceRoot = join(repoRoot, "packages/coding-agent/dist/experimental");
+	return [
+		{
+			path: "node_modules/@earendil-works/pi-coding-agent/dist/experimental/plugin.js",
+			data: readFileSync(join(sourceRoot, "plugin.js")),
+			executable: false,
+		},
+		...readTree(
+			join(sourceRoot, "services"),
+			"node_modules/@earendil-works/pi-coding-agent/dist/experimental/services",
+		),
+	];
 }
 
 function readChordRuntime(repoRoot) {
