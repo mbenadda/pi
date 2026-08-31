@@ -678,11 +678,15 @@ async function ensureRemoteServer(
 		if (runningGeneration === undefined) {
 			console.log(`Replacing stale Workspace server with revision ${paths.revision}…`);
 			const stopped = await sshExec(host, remoteCommands.stopServer(paths));
-			if (!stopped.stdout.includes("stopped")) throw new Error("Refused to stop the previous MVP server revision");
-			const deadline = Date.now() + SERVER_STOP_TIMEOUT_MS;
-			while (Date.now() < deadline) {
-				if ((await sshExec(host, remoteCommands.hasSocket(socketPath))).code !== 0) break;
-				await new Promise<void>((resolve) => setTimeout(resolve, POLL_MS));
+			if (!stopped.stdout.includes("stopped") && !stopped.stdout.includes("absent")) {
+				throw new Error("Refused to stop the previous Pi Workspace server revision");
+			}
+			if (stopped.stdout.includes("stopped")) {
+				const deadline = Date.now() + SERVER_STOP_TIMEOUT_MS;
+				while (Date.now() < deadline) {
+					if ((await sshExec(host, remoteCommands.hasSocket(socketPath))).code !== 0) break;
+					await new Promise<void>((resolve) => setTimeout(resolve, POLL_MS));
+				}
 			}
 		}
 	}
