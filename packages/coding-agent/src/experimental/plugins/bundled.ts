@@ -50,12 +50,5 @@ export function createPresentationFacetLoaders(data: JsonValue): readonly FacetL
 }
 
 function resolvePluginExternal(specifier: string): string | undefined {
-	if (
-		specifier === PI_PLUGIN_API ||
-		specifier === "@earendil-works/chord" ||
-		specifier.startsWith("@earendil-works/chord/")
-	) {
-		return import.meta.resolve(specifier);
-	}
-	return undefined;
+	return specifier === PI_PLUGIN_API ? import.meta.resolve(specifier) : undefined;
 }
