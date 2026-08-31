@@ -840,7 +840,7 @@ async function reportWorkspaceStatus(
 	console.log(`Host:            ${host}`);
 	console.log(`Remote cwd:      ${remoteCwd}`);
 	console.log(`Revision:        ${revision} (${staged.code === 0 ? "installed" : "not installed"})`);
-	console.log(`Remote runtime:  ${toolchain.nodeVersion} (${toolchain.nodePath})`);
+	console.log(`Remote runtime:  ${toolchain.nodeVersion} (${paths.standalone ? paths.cliEntry : toolchain.nodePath})`);
 	console.log(`State root:      ${paths.stateRoot}`);
 	console.log(`Staging root:    ${paths.shareRoot}`);
 	const serverId = await readRemoteServerId(host, paths);
@@ -867,9 +867,9 @@ async function reportWorkspaceStatus(
 async function cleanupWorkspace(host: string, paths: WorkspaceRemotePaths, purge: boolean): Promise<void> {
 	const stop = await sshExec(host, remoteCommands.stopServer(paths));
 	if (stop.stdout.includes("stopped")) {
-		console.log("Stopped the MVP Workspace server. Remote sessions remain durable for reconnect.");
+		console.log("Stopped the Pi Workspace server. Remote sessions remain durable for reconnect.");
 	} else {
-		console.log("No MVP Workspace server process found (already clean).");
+		console.log("No Pi Workspace server process found (already clean).");
 	}
 	const serverId = await readRemoteServerId(host, paths);
 	if (serverId !== undefined) {
