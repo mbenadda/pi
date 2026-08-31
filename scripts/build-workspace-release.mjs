@@ -71,13 +71,19 @@ export function buildWorkspaceRelease(options) {
 			throw new Error(`Workspace server requires a pinned esbuild binary next to its runtime: ${esbuildPath}`);
 		}
 		const chordRoot = join(repoRoot, "packages/chord");
+		const chordPackage = JSON.parse(readFileSync(join(chordRoot, "package.json"), "utf8"));
+		for (const target of Object.values(chordPackage.exports)) {
+			if (typeof target === "object" && target !== null && typeof target.import === "string") {
+				target.require = target.import;
+			}
+		}
 		const archive = createWorkspaceTarGzip([
 			{ path: entrypoint, data: readFileSync(binaryPath), executable: true },
 			{ path: "bin/esbuild", data: readFileSync(esbuildPath), executable: true },
 			...readTree(pluginRoot, "plugins/pi-example-plugin"),
 			{
 				path: "node_modules/@earendil-works/chord/package.json",
-				data: readFileSync(join(chordRoot, "package.json")),
+				data: Buffer.from(`${JSON.stringify(chordPackage, undefined, "\t")}\n`),
 				executable: false,
 			},
 			...readTree(join(chordRoot, "src"), "node_modules/@earendil-works/chord/src"),
