@@ -10,9 +10,15 @@ import { main } from "./main.ts";
 
 const internalProcessRole = consumeInternalProcessRole();
 if (internalProcessRole === "server") {
-	void runServerProcess(process.argv.slice(2)).catch(() => process.exit(1));
+	void runServerProcess(process.argv.slice(2)).catch((error: unknown) => {
+		console.error(error);
+		process.exit(1);
+	});
 } else if (internalProcessRole === "session-worker") {
-	void runSessionWorkerProcess(process.argv.slice(2)).catch(() => process.exit(1));
+	void runSessionWorkerProcess(process.argv.slice(2)).catch((error: unknown) => {
+		console.error(error);
+		process.exit(1);
+	});
 } else {
 	if (internalProcessRole !== undefined) {
 		throw new Error(`Internal ${internalProcessRole} process must use its lightweight entrypoint`);

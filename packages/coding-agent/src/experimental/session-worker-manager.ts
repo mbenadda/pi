@@ -466,6 +466,7 @@ export class SessionWorkerManager {
 				...(this.#model ?? {}),
 			};
 			child = spawnInternalProcess("session-worker", [JSON.stringify(options)], {
+				stdio: "inherit",
 				env: {
 					// Provider headers and server-side extensions need the durable Pi
 					// identity even though no interactive client process owns this worker.

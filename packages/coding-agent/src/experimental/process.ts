@@ -35,6 +35,7 @@ export function consumeInternalProcessRole(): InternalProcessRole | undefined {
 export interface InternalProcessSpawnOptions {
 	readonly entryUrl?: URL;
 	readonly env?: NodeJS.ProcessEnv;
+	readonly stdio?: "ignore" | "inherit";
 }
 
 /** Spawn a detached Pi-owned process consistently across Node and compiled Bun. */
@@ -61,7 +62,7 @@ export function spawnInternalProcess(
 				...options.env,
 				[INTERNAL_PROCESS_ENV]: role,
 			},
-			stdio: "ignore",
+			stdio: options.stdio ?? "ignore",
 			windowsHide: true,
 		},
 	);
