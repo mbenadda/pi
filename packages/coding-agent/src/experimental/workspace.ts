@@ -128,7 +128,7 @@ export function buildInstalledWorkspaceRemotePaths(
 		serverRevisionFile: `${stateRoot}/server.generation`,
 		serverLogPath: `${stateRoot}/server.log`,
 		serverIdFile: `${serverDir}/default-server-id`,
-		bridgePath: "--workspace-ssh-bridge",
+		bridgePath: `${revisionDir}/bin/pi-workspace-server`,
 		cliEntry: `${revisionDir}/bin/pi-workspace-server`,
 		markerPath: `${revisionDir}/install.json`,
 		standalone: true,
@@ -763,7 +763,7 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 		paths = buildInstalledWorkspaceRemotePaths(home, bundle.manifest.revision, bundle.artifact.sha256);
 		toolchain = {
 			home,
-			nodePath: paths.cliEntry,
+			nodePath: "/usr/bin/env",
 			npmPath: paths.cliEntry,
 			nodeVersion: `standalone ${bundle.manifest.revision}`,
 		};

@@ -165,7 +165,7 @@ describe("workspace remote paths and command construction", () => {
 			shareRoot: `${HOME}/.local/share/pi-workspace-server`,
 			stateRoot: `${HOME}/.local/state/pi-workspace-server`,
 			revisionDir: `${HOME}/.local/share/pi-workspace-server/releases/${digest}`,
-			bridgePath: "--workspace-ssh-bridge",
+			bridgePath: `${HOME}/.local/share/pi-workspace-server/releases/${digest}/bin/pi-workspace-server`,
 			cliEntry: `${HOME}/.local/share/pi-workspace-server/releases/${digest}/bin/pi-workspace-server`,
 			standalone: true,
 		});

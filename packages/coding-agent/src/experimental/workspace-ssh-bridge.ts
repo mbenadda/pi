@@ -15,7 +15,7 @@ export async function runWorkspaceSshBridge(
 ): Promise<void> {
 	const [socketPath] = args;
 	if (args.length !== 1 || socketPath === undefined || !SOCKET_PATH_PATTERN.test(socketPath)) {
-		throw new Error("usage: pi-workspace-server --workspace-ssh-bridge <absolute-socket-path>");
+		throw new Error("usage: pi-workspace-server <absolute-socket-path>");
 	}
 	const socket = createConnection(socketPath);
 	await new Promise<void>((resolve, reject) => {
