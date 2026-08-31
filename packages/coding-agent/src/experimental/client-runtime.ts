@@ -1,8 +1,10 @@
 import { basename } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Client, ServerError } from "@earendil-works/pi-client";
+import { createSshTransportFactory } from "@earendil-works/pi-client/ssh";
 import { createUnixTransportFactory, discoverUnixServers, type UnixServerRoute } from "@earendil-works/pi-client/unix";
 import { isServerId, type ServerId } from "@earendil-works/pi-protocol";
+import type { SshTransportAddress } from "../cli/experimental/command-options.ts";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import { RadiusRelayAuthResolver } from "./radius-auth.ts";
 import { createRadiusClientTransportFactory, RadiusClientReconnect } from "./radius-relay.ts";
@@ -21,7 +23,8 @@ import { Transcript } from "./services/transcript.ts";
 
 export type ClientRuntimeRoute =
 	| ({ readonly transport: "unix" } & UnixServerRoute)
-	| { readonly transport: "radius"; readonly serverId: ServerId };
+	| { readonly transport: "radius"; readonly serverId: ServerId }
+	| ({ readonly transport: "ssh" } & Omit<SshTransportAddress, "transport">);
 
 export interface ClientRuntimeServer {
 	readonly route: ClientRuntimeRoute;
@@ -66,6 +69,9 @@ export async function openClientRuntime(
 	if (command.connect?.transport === "radius" && command.pluginPackages !== undefined) {
 		throw new Error("Plugin package paths can only be configured on a local Unix server");
 	}
+	if (command.connect?.transport === "ssh" && command.pluginPackages !== undefined) {
+		throw new Error("Plugin package paths must reference remote filesystem paths and be configured on the server");
+	}
 	const directory = resolveServerDirectory(options.directory);
 	let routes: ClientRuntimeRoute[];
 	let activatedClient: Client | undefined;
@@ -73,7 +79,16 @@ export async function openClientRuntime(
 		routes = [
 			command.connect.transport === "radius"
 				? { transport: "radius", serverId: command.connect.serverId }
-				: { transport: "unix", ...routeFromExplicitPath(command.connect.path) },
+				: command.connect.transport === "ssh"
+					? {
+							transport: "ssh",
+							host: command.connect.host,
+							serverId: command.connect.serverId,
+							path: command.connect.path,
+							bridgePath: command.connect.bridgePath,
+							nodePath: command.connect.nodePath,
+						}
+					: { transport: "unix", ...routeFromExplicitPath(command.connect.path) },
 		];
 	} else {
 		routes = (await discoverUnixServers({ directory })).map((route) => ({ transport: "unix", ...route }));
@@ -126,10 +141,15 @@ export async function openClientRuntime(
 						transportFactory:
 							route.transport === "unix"
 								? createUnixTransportFactory({ path: route.path })
-								: createRadiusClientTransportFactory({
-										serverId: route.serverId,
-										auth: new RadiusRelayAuthResolver(command.auth),
-									}),
+								: route.transport === "ssh"
+									? createSshTransportFactory({
+											host: route.host,
+											remoteCommand: [route.nodePath, route.bridgePath, route.path],
+										})
+									: createRadiusClientTransportFactory({
+											serverId: route.serverId,
+											auth: new RadiusRelayAuthResolver(command.auth),
+										}),
 					});
 				} catch (error) {
 					if (
@@ -153,7 +173,7 @@ export async function openClientRuntime(
 			clients.push(client);
 			const server = createServerServiceSource(client);
 			serviceSources.push(server);
-			if (route.transport === "radius") {
+			if (route.transport === "radius" || route.transport === "ssh") {
 				const reconnectServices = server.open({
 					services: [SessionManagement],
 					assertAccess() {},

@@ -30,6 +30,7 @@ import { resolveCredentialForPrint } from "./cli/credential-print.ts";
 import { cli as experimentalCli } from "./cli/experimental/cli.ts";
 import type { ClientCommand } from "./cli/experimental/commands/client.ts";
 import type { ServerCommand } from "./cli/experimental/commands/server.ts";
+import type { WorkspaceCommand } from "./cli/experimental/commands/workspace.ts";
 import { processFileArguments } from "./cli/file-processor.ts";
 import { buildInitialMessage } from "./cli/initial-message.ts";
 import { listModels } from "./cli/list-models.ts";
@@ -69,6 +70,7 @@ import { runClient } from "./experimental/client.ts";
 import { runClientTui } from "./experimental/client-tui.ts";
 import type { RadiusRelayHostStatus } from "./experimental/radius-relay.ts";
 import { startForegroundServer } from "./experimental/server.ts";
+import { runWorkspace } from "./experimental/workspace.ts";
 import { builtInExtensions } from "./extensions/index.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
@@ -648,12 +650,19 @@ async function runClientCommand(command: ClientCommand): Promise<void> {
 	for (const session of result.sessions) console.log(`${session.serverId}\t${session.sessionId}`);
 }
 
+async function runWorkspaceCommand(command: WorkspaceCommand): Promise<void> {
+	await runWorkspace(command);
+}
+
 async function runExperimentalCommand(args: string[]): Promise<boolean> {
-	if (!areExperimentalFeaturesEnabled() || (args[0] !== "server" && args[0] !== "client")) return false;
+	if (!areExperimentalFeaturesEnabled() || (args[0] !== "server" && args[0] !== "client" && args[0] !== "workspace")) {
+		return false;
+	}
 	try {
 		const result = await experimentalCli.execute(args, {
 			runServer: runExperimentalServerCommand,
 			runClient: runClientCommand,
+			runWorkspace: runWorkspaceCommand,
 		});
 		if (!result.ok) {
 			for (const error of result.errors) console.error(chalk.red(`Error: ${error}`));
@@ -686,7 +695,7 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	if (await runExperimentalCommand(args)) {
-		if (args[0] === "client") process.exit(process.exitCode ?? 0);
+		if (args[0] === "client" || args[0] === "workspace") process.exit(process.exitCode ?? 0);
 		return;
 	}
 

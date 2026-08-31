@@ -5,7 +5,7 @@ describe("experimental CLI command composition", () => {
 	test("requires an experimental subcommand", () => {
 		expect(cli.parse([])).toEqual({
 			ok: false,
-			errors: ["Expected experimental command: server or client"],
+			errors: ["Expected experimental command: server, client, or workspace"],
 		});
 	});
 
@@ -23,7 +23,7 @@ describe("experimental CLI command composition", () => {
 				"--model",
 				"claude-sonnet-4-5",
 			],
-			{ runServer, runClient: vi.fn(() => undefined) },
+			{ runServer, runClient: vi.fn(() => undefined), runWorkspace: vi.fn(() => undefined) },
 		);
 
 		const command = {
@@ -37,13 +37,23 @@ describe("experimental CLI command composition", () => {
 		expect(runServer).toHaveBeenCalledWith(command);
 	});
 
-	test.each(["server", "client"] as const)("executes the parsed %s command", async (name) => {
+	test.each(["server", "client", "workspace"] as const)("executes the parsed %s command", async (name) => {
 		const context = {
 			runServer: vi.fn(() => undefined),
 			runClient: vi.fn(() => undefined),
+			runWorkspace: vi.fn(() => undefined),
 		};
 		const result = await cli.execute([name], context);
 
+		if (name === "workspace") {
+			// The workspace command requires host and remote cwd, so it reports errors.
+			expect(result).toEqual({
+				ok: false,
+				errors: ["--ssh-host is required", "--remote-cwd is required"],
+			});
+			expect(context.runWorkspace).toHaveBeenCalledTimes(0);
+			return;
+		}
 		expect(result).toEqual({ ok: true, command: { command: name } });
 		expect(context.runServer).toHaveBeenCalledTimes(name === "server" ? 1 : 0);
 		expect(context.runClient).toHaveBeenCalledTimes(name === "client" ? 1 : 0);

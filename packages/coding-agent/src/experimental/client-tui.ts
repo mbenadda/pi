@@ -56,6 +56,7 @@ export interface RunClientTuiOptions extends OpenClientRuntimeOptions {
 
 export interface ClientTuiServer {
 	readonly serverId: string;
+	/** True when the transport is a reconnectable remote connection (Radius or SSH). */
 	readonly radius: boolean;
 	readonly server: ServerServiceSource;
 	readonly session: SessionServiceSource;
@@ -456,7 +457,8 @@ export class ExperimentalClientTui implements Component {
 			return;
 		}
 		this.#busy = true;
-		this.#status = state.status === "connecting" ? "Reconnecting to Radius…" : "Radius disconnected; retrying…";
+		this.#status =
+			state.status === "connecting" ? "Reconnecting to remote server…" : "Remote server disconnected; retrying…";
 		this.#queueRecovery(() => this.#closeLane());
 		this.#rebuild();
 	}
@@ -768,7 +770,7 @@ export async function runClientTui(command: ClientCommand, options: RunClientTui
 			ui: tui,
 			servers: runtime.servers.map((server) => ({
 				serverId: server.route.serverId,
-				radius: server.route.transport === "radius",
+				radius: server.route.transport !== "unix",
 				server: server.server,
 				session: server.session,
 			})),

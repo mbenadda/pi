@@ -105,6 +105,10 @@
         {
           "title": "TUI Components",
           "path": "tui.md"
+        },
+        {
+          "title": "Workspace Client/Server (MVP)",
+          "path": "workspace-mvp.md"
         }
       ]
     },

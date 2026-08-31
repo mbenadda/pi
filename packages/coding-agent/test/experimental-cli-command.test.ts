@@ -56,6 +56,26 @@ describe("experimental CLI commands", () => {
 				sessionId: "demo-1",
 			},
 		});
+		expect(
+			cli.parse([
+				"client",
+				"--connect",
+				"ssh://workspace-bcli-10/home/bits/.local/state/pi-workspace-mvp/server/00000000-0000-4000-8000-000000000001.sock?bridge=/home/bits/.local/share/pi-workspace-mvp/rev/scripts/workspace-ssh-bridge.mjs&node=/home/bits/.volta/bin/node",
+			]),
+		).toEqual({
+			ok: true,
+			command: {
+				command: "client",
+				connect: {
+					transport: "ssh",
+					host: "workspace-bcli-10",
+					serverId: "00000000-0000-4000-8000-000000000001",
+					path: "/home/bits/.local/state/pi-workspace-mvp/server/00000000-0000-4000-8000-000000000001.sock",
+					bridgePath: "/home/bits/.local/share/pi-workspace-mvp/rev/scripts/workspace-ssh-bridge.mjs",
+					nodePath: "/home/bits/.volta/bin/node",
+				},
+			},
+		});
 	});
 
 	test.each([
@@ -132,6 +152,20 @@ describe("experimental CLI commands", () => {
 			"--session-dir may only be specified once",
 		],
 		[["client", "--connect="], "--connect requires a value"],
+		[["client", "--connect", "ssh://bad host/a.sock"], 'Invalid --connect address "ssh://bad host/a.sock"'],
+		[["client", "--connect", "ssh://-leading/a.sock"], 'Invalid SSH transport host "-leading"'],
+		[
+			["client", "--connect", "ssh://workspace-bcli-10/home/bits/not-a-server.sock?bridge=/b&node=/n"],
+			"SSH transport address requires a <uuidv4-server-id>.sock socket path",
+		],
+		[
+			[
+				"client",
+				"--connect",
+				"ssh://workspace-bcli-10/home/bits/00000000-0000-4000-8000-000000000001.sock?node=/home/bits/.volta/bin/node",
+			],
+			"SSH transport address requires bridge and node query parameters",
+		],
 	] as const)("rejects invalid experimental input %j", (argv, error) => {
 		const result = cli.parse(argv);
 		expect(result).toMatchObject({ ok: false });
