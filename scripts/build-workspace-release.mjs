@@ -66,9 +66,14 @@ export function buildWorkspaceRelease(options) {
 		const binaryPath = realpathSync(resolve(input.binaryPath));
 		if (!statSync(binaryPath).isFile()) throw new Error(`Workspace runtime is not a file: ${binaryPath}`);
 		const entrypoint = "bin/pi-workspace-server";
+		const esbuildPath = join(dirname(binaryPath), "esbuild");
+		if (!existsSync(esbuildPath) || !statSync(esbuildPath).isFile()) {
+			throw new Error(`Workspace server requires a pinned esbuild binary next to its runtime: ${esbuildPath}`);
+		}
 		const chordRoot = join(repoRoot, "packages/chord");
 		const archive = createWorkspaceTarGzip([
 			{ path: entrypoint, data: readFileSync(binaryPath), executable: true },
+			{ path: "bin/esbuild", data: readFileSync(esbuildPath), executable: true },
 			...readTree(pluginRoot, "plugins/pi-example-plugin"),
 			{
 				path: "node_modules/@earendil-works/chord/package.json",

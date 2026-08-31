@@ -290,6 +290,7 @@ export const remoteCommands = {
 		return (
 			`rm -rf ${temporary} ${next} && mkdir -p ${temporary} && chmod 700 ${temporary}` +
 			` && tar -xz -C ${temporary} && test -x ${temporary}/bin/pi-workspace-server` +
+			` && test -x ${temporary}/bin/esbuild` +
 			` && printf %s ${artifactSha256} > ${temporary}/install.json && chmod 600 ${temporary}/install.json` +
 			` && if [ -d ${target} ]; then test "$(cat ${marker})" = ${artifactSha256} && rm -rf ${temporary};` +
 			` else mv ${temporary} ${target}; fi` +
@@ -343,8 +344,11 @@ export const remoteCommands = {
 			(packagePath) => `-e ${requireValidRemotePath(packagePath, "plugin package")}`,
 		);
 		const runtime = options.paths.standalone ? cli : `${node} ${cli}`;
+		const standaloneEnv = options.paths.standalone
+			? ` ESBUILD_BINARY_PATH=${requireValidRemotePath(`${options.paths.revisionDir}/bin/esbuild`, "esbuild path")}`
+			: "";
 		return (
-			`cd ${cwd} && { nohup env PI_EXPERIMENTAL=1 PI_SERVER_DIR=${serverDir} ${runtime} server` +
+			`cd ${cwd} && { nohup env PI_EXPERIMENTAL=1 PI_SERVER_DIR=${serverDir}${standaloneEnv} ${runtime} server` +
 			` --session-dir ${sessionDir}${serverId.length > 0 ? ` ${serverId.join(" ")}` : ""}` +
 			`${plugins.length > 0 ? ` ${plugins.join(" ")}` : ""}` +
 			` --ready-file ${revisionFile} --generation ${options.generation}` +

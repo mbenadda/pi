@@ -40,6 +40,7 @@ test("builds deterministic checksummed client and server Workspace artifacts", a
 		await Promise.all([mkdir(join(root, "client-build")), mkdir(join(root, "server-build"))]);
 		await writeFile(clientBinary, "client-runtime");
 		await writeFile(serverBinary, "server-runtime");
+		await writeFile(join(root, "server-build", "esbuild"), "esbuild-runtime");
 		const inputs = [
 			{ role: "server", platform: "linux-x64", binaryPath: serverBinary },
 			{ role: "client", platform: "darwin-arm64", binaryPath: clientBinary },
