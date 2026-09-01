@@ -267,7 +267,8 @@ export const remoteCommands = {
 		const validated = dirs.map((path) => requireValidRemotePath(path, "state directory"));
 		return (
 			`mkdir -p ${validated.join(" ")} && chmod 700 ${validated.join(" ")}` +
-			` && for p in ${validated.join(" ")}; do test -d "$p" && test ! -L "$p" || exit 1; done`
+			` && for p in ${validated.join(" ")}; do test -d "$p" && test ! -L "$p"` +
+			` && test "$(stat -c %u "$p")" = "$(id -u)" && test "$(stat -c %a "$p")" = 700 || exit 1; done`
 		);
 	},
 	isStaged(paths: WorkspaceRemotePaths): string {
@@ -277,16 +278,45 @@ export const remoteCommands = {
 		if (!paths.standalone || !/^[0-9a-f]{64}$/u.test(artifactSha256)) throw new Error("Invalid installed artifact");
 		const marker = requireValidRemotePath(paths.markerPath, "install marker");
 		const entrypoint = requireValidRemotePath(paths.cliEntry, "server entrypoint");
+		const esbuild = requireValidRemotePath(`${paths.revisionDir}/bin/esbuild`, "esbuild entrypoint");
 		const shareRoot = requireValidRemotePath(paths.shareRoot, "runtime root");
+		const releases = requireValidRemotePath(`${shareRoot}/releases`, "release root");
+		const releaseDir = requireValidRemotePath(paths.revisionDir, "release directory");
 		const releaseName = basename(paths.revisionDir);
 		if (!new RegExp(`^[0-9a-f]{64}-${artifactSha256}$`, "u").test(releaseName))
 			throw new Error("Invalid release identity");
+		const lock = `${shareRoot}/.install-transaction.lock`;
+		const next = `${shareRoot}/.reuse-current-${releaseName}-$$`;
+		const ownedDirectory = (directory: string) =>
+			`test -d ${directory} && test ! -L ${directory} && test "$(stat -c %u ${directory})" = "$(id -u)"`;
+		const prune =
+			`prune_install_scratch() { active_target=$(readlink ${shareRoot}/current 2>/dev/null || true);` +
+			` for scratch in ${shareRoot}/.candidate-* ${releases}/.repair-*; do` +
+			` if [ ! -e "$scratch" ] && [ ! -L "$scratch" ]; then continue; fi;` +
+			` relative_scratch=\${scratch#${shareRoot}/};` +
+			` if [ "$active_target" = "$relative_scratch" ]; then continue; fi;` +
+			` test -d "$scratch" && test ! -L "$scratch"` +
+			` && test "$(stat -c %u "$scratch")" = "$(id -u)" || return 1;` +
+			` rm -rf "$scratch" || return 1; done; }`;
 		return (
-			`test -x ${entrypoint} && test "$(cat ${marker})" = ${releaseName}` +
-			` && test "$(readlink ${shareRoot}/current)" = releases/${releaseName}` +
-			` && cd ${requireValidRemotePath(paths.revisionDir, "release directory")}` +
-			` && test -z "$(find . ! -type d ! -type f -print -quit)"` +
-			` && find . -type f ! -name .tree.sha256 -print0 | sort -z | xargs -0 sha256sum | cmp - .tree.sha256`
+			`${ownedDirectory(shareRoot)} && ${ownedDirectory(releases)}` +
+			` && if [ -e ${lock} ] || [ -L ${lock} ]; then` +
+			` test -f ${lock} && test ! -L ${lock};` +
+			` else (umask 077; set -C; : > ${lock}) 2>/dev/null || true; fi` +
+			` && test -f ${lock} && test ! -L ${lock}` +
+			` && test "$(stat -c %u ${lock})" = "$(id -u)" && chmod 600 ${lock}` +
+			` && command -v flock >/dev/null && exec 9>> ${lock} && flock -w 120 9` +
+			` && ${prune}` +
+			` && cleanup_workspace_reuse() { status=$?; prune_install_scratch || status=1; rm -f ${next};` +
+			` flock -u 9; exec 9>&-; trap - EXIT HUP INT TERM; exit "$status"; }` +
+			` && trap cleanup_workspace_reuse EXIT HUP INT TERM && prune_install_scratch` +
+			` && ${ownedDirectory(releaseDir)} && test -x ${entrypoint} && test -x ${esbuild}` +
+			` && test "$(cat ${marker})" = ${releaseName}` +
+			` && cd ${releaseDir} && test -z "$(find . ! -type d ! -type f -print -quit)"` +
+			` && find . -type f ! -name .tree.sha256 -print0 | sort -z | xargs -0 sha256sum | cmp - .tree.sha256` +
+			` && if [ -e ${shareRoot}/current ] && [ ! -L ${shareRoot}/current ]; then exit 1; fi` +
+			` && rm -f ${next} && cd ${shareRoot} && ln -s releases/${releaseName} ${next}` +
+			` && mv -Tf ${next} ${shareRoot}/current`
 		);
 	},
 	extractArchive(paths: WorkspaceRemotePaths): string {
@@ -297,20 +327,28 @@ export const remoteCommands = {
 		if (!paths.standalone) throw new Error("Installed artifact paths are required");
 		if (!/^[0-9a-f]{64}$/u.test(artifactSha256)) throw new Error("Invalid artifact checksum");
 		const shareRoot = requireValidRemotePath(paths.shareRoot, "runtime root");
+		const releases = requireValidRemotePath(`${shareRoot}/releases`, "release root");
+		const quarantineRoot = requireValidRemotePath(`${shareRoot}/quarantine`, "quarantine root");
 		const target = requireValidRemotePath(paths.revisionDir, "release directory");
 		const entrypoint = requireValidRemotePath(paths.cliEntry, "server entrypoint");
+		const esbuild = requireValidRemotePath(`${paths.revisionDir}/bin/esbuild`, "esbuild entrypoint");
 		const releaseName = basename(paths.revisionDir);
 		if (!new RegExp(`^[0-9a-f]{64}-${artifactSha256}$`, "u").test(releaseName))
 			throw new Error("Invalid release identity");
 		const temporary = `${shareRoot}/.install-${releaseName}-$$`;
 		const candidate = `${shareRoot}/.candidate-${releaseName}-$$`;
-		const fallback = `${shareRoot}/releases/.repair-${releaseName}-$$`;
+		const fallback = `${releases}/.repair-${releaseName}-$$`;
 		const archive = `${temporary}.tar.gz`;
 		const next = `${shareRoot}/.current-${releaseName}-$$`;
 		const rollbackNext = `${shareRoot}/.rollback-current-${releaseName}-$$`;
-		const quarantine = `${shareRoot}/quarantine/${releaseName}-$$`;
+		const quarantine = `${quarantineRoot}/${releaseName}-$$`;
+		const lock = `${shareRoot}/.install-transaction.lock`;
+		const ownedDirectory = (directory: string) =>
+			`test -d ${directory} && test ! -L ${directory} && test "$(stat -c %u ${directory})" = "$(id -u)"`;
 		const validateDirectory = (directory: string) =>
-			`cd ${directory} && test -z "$(find . ! -type d ! -type f -print -quit)"` +
+			`${ownedDirectory(directory)} && test -x ${directory}/bin/pi-workspace-server` +
+			` && test -x ${directory}/bin/esbuild && test "$(cat ${directory}/install.json)" = ${releaseName}` +
+			` && cd ${directory} && test -z "$(find . ! -type d ! -type f -print -quit)"` +
 			` && find . -type f ! -name .tree.sha256 -print0 | sort -z | xargs -0 sha256sum | cmp - .tree.sha256`;
 		const activate = (targetName: string, link: string) =>
 			`rm -f ${link} && cd ${shareRoot} && ln -s releases/${targetName} ${link}` +
@@ -318,8 +356,30 @@ export const remoteCommands = {
 		const restore =
 			`rm -rf ${target} && mv -T ${quarantine} ${target}` +
 			` && if [ "$active" = 1 ]; then ${activate(releaseName, rollbackNext)} && rm -rf ${fallback}; fi`;
+		const prune =
+			`prune_install_scratch() { active_target=$(readlink ${shareRoot}/current 2>/dev/null || true);` +
+			` for scratch in ${shareRoot}/.candidate-* ${releases}/.repair-*; do` +
+			` if [ ! -e "$scratch" ] && [ ! -L "$scratch" ]; then continue; fi;` +
+			` relative_scratch=\${scratch#${shareRoot}/};` +
+			` if [ "$active_target" = "$relative_scratch" ]; then continue; fi;` +
+			` test -d "$scratch" && test ! -L "$scratch"` +
+			` && test "$(stat -c %u "$scratch")" = "$(id -u)" || return 1;` +
+			` rm -rf "$scratch" || return 1; done; }`;
+		const cleanup =
+			`cleanup_workspace_install() { status=$?; prune_install_scratch || status=1;` +
+			` rm -rf ${temporary} ${archive} ${next} ${rollbackNext};` +
+			` flock -u 9; exec 9>&-; trap - EXIT HUP INT TERM; exit "$status"; }`;
 		return (
-			`rm -rf ${temporary} ${candidate} ${fallback} ${archive} ${next} ${rollbackNext} && cat > ${archive}` +
+			`${ownedDirectory(shareRoot)} && ${ownedDirectory(releases)} && ${ownedDirectory(quarantineRoot)}` +
+			` && if [ -e ${lock} ] || [ -L ${lock} ]; then` +
+			` test -f ${lock} && test ! -L ${lock};` +
+			` else (umask 077; set -C; : > ${lock}) 2>/dev/null || true; fi` +
+			` && test -f ${lock} && test ! -L ${lock}` +
+			` && test "$(stat -c %u ${lock})" = "$(id -u)" && chmod 600 ${lock}` +
+			` && command -v flock >/dev/null && exec 9>> ${lock} && flock -w 120 9` +
+			` && ${prune} && ${cleanup} && trap cleanup_workspace_install EXIT HUP INT TERM` +
+			` && prune_install_scratch` +
+			` && rm -rf ${temporary} ${archive} ${next} ${rollbackNext} && cat > ${archive}` +
 			` && test "$(sha256sum ${archive} | cut -d " " -f 1)" = ${artifactSha256}` +
 			` && mkdir ${temporary} && chmod 700 ${temporary}` +
 			` && tar -xzf ${archive} -C ${temporary} --no-same-owner --no-same-permissions && rm -f ${archive}` +
@@ -341,8 +401,9 @@ export const remoteCommands = {
 			` ${restore}; exit 1; fi` +
 			` && if ! (${activate(releaseName, next)}); then ${restore}; exit 1; fi` +
 			` && rm -rf ${fallback}; fi;` +
-			` else mv -T ${temporary} ${target} && ${activate(releaseName, next)}; fi` +
-			` && test -x ${entrypoint}`
+			` else mv -T ${temporary} ${target} && (${validateDirectory(target)})` +
+			` && ${activate(releaseName, next)}; fi` +
+			` && test -x ${entrypoint} && test -x ${esbuild}`
 		);
 	},
 	installAndBuild(paths: WorkspaceRemotePaths, toolchain: WorkspaceRemoteToolchain): string {

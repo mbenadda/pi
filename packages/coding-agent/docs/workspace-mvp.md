@@ -45,7 +45,13 @@ node scripts/install-workspace-release.mjs \
   --manifest-sha256 <digest-pinned-in-release-metadata>
 ```
 
-The digest is mandatory and must not be derived from the downloaded manifest or its adjacent checksum file. Directories and executables are mode `0700`; metadata and plugin source are `0600`. Installation extracts into a private temporary directory, verifies the immutable manifest, embedded artifact revision/protocol/role identity, artifact size, SHA-256, tar header checksum, entry types, normalized paths, and every reused file, renames the manifest-and-content-addressed release, then atomically replaces `current`. Partial or changed releases move to `quarantine` and are repaired before activation. Links, traversal, absolute archive paths, corrupt archives, and receipt mismatches fail before activation. Existing valid releases remain rollbackable.
+The digest is mandatory and must not be derived from the downloaded manifest or its adjacent checksum file. Directories and executables are mode `0700`; metadata and plugin source are `0600`. Installation extracts into a private temporary directory, verifies the immutable manifest, embedded artifact revision/protocol/role identity, artifact size, SHA-256, tar header checksum, entry types, normalized paths, executable modes, and every reused file, renames the manifest-and-content-addressed release, then atomically replaces `current`. Partial, changed, or mode-corrupt releases move to `quarantine` and are repaired before activation. Links, traversal, absolute archive paths, corrupt archives, and receipt mismatches fail before activation. Existing valid releases remain rollbackable.
+
+Local installation and remote backend activation serialize their full reuse, repair, and `current` transaction under their private share root. Lock acquisition has a bounded wait and stale-owner recovery; lock paths and share directories must have the expected type and current-user ownership. Abandoned unreferenced `.candidate-*` and `.repair-*` trees are removed while holding the lock. A scratch tree named by `current` is preserved until another verified release is active, so concurrent installers cannot make `current` dangle.
+
+### Repair fault injection
+
+`installWorkspaceArtifact()` accepts `onRepairQuarantined` only as a test seam. Tests use it to pause or fail after an active corrupt release has moved to `quarantine`, while `current` points at its verified repair fallback, and before the replacement is activated. Production installers must leave it unset; it is not a runtime hook or supported installer extension point.
 
 ## Artifact contract
 

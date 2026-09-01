@@ -16,6 +16,7 @@ import {
 import { basename, dirname, join, posix, relative, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { PROTOCOL_VERSION } from "@earendil-works/pi-protocol";
+import lockfile from "proper-lockfile";
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const REVISION_PATTERN = /^[0-9a-f]{40}$/u;
@@ -26,6 +27,9 @@ const MAX_ARTIFACT_BYTES = 512 * 1024 * 1024;
 const TAR_BLOCK_BYTES = 512;
 const MAX_ARCHIVE_ENTRIES = 100_000;
 const ARTIFACT_IDENTITY_PATH = ".pi-workspace-artifact.json";
+const INSTALL_LOCK_STALE_MS = 30_000;
+const INSTALL_LOCK_WAIT_MS = 120_000;
+const INSTALL_LOCK_RETRY_MS = 100;
 
 export type WorkspaceArtifactRole = "client" | "server";
 
@@ -165,6 +169,7 @@ export async function installWorkspaceArtifact(options: {
 	readonly expectedManifestSha256: string;
 	readonly role: WorkspaceArtifactRole;
 	readonly platform: string;
+	/** Test-only fault seam invoked after the corrupt release is quarantined and before replacement activation. */
 	readonly onRepairQuarantined?: () => Promise<void>;
 }): Promise<InstalledWorkspaceRelease> {
 	const root = resolve(options.root);
@@ -182,63 +187,90 @@ export async function installWorkspaceArtifact(options: {
 	await ensurePrivateDirectory(releasesDir);
 	const releaseName = `${options.expectedManifestSha256}-${artifact.sha256}`;
 	const releaseDir = join(releasesDir, releaseName);
-	const receipt = `${JSON.stringify(
-		{
-			schemaVersion: 1,
-			manifestSha256: options.expectedManifestSha256,
-			revision: manifest.revision,
-			protocolVersion: manifest.protocolVersion,
-			artifact,
+	const lockPath = join(root, ".install-transaction-lock");
+	await validateInstallLockPath(lockPath);
+	const releaseLock = await lockfile.lock(root, {
+		realpath: false,
+		lockfilePath: lockPath,
+		stale: INSTALL_LOCK_STALE_MS,
+		update: INSTALL_LOCK_STALE_MS / 3,
+		retries: {
+			retries: Math.ceil(INSTALL_LOCK_WAIT_MS / INSTALL_LOCK_RETRY_MS),
+			factor: 1,
+			minTimeout: INSTALL_LOCK_RETRY_MS,
+			maxTimeout: INSTALL_LOCK_RETRY_MS,
+			maxRetryTime: INSTALL_LOCK_WAIT_MS,
 		},
-		undefined,
-		"\t",
-	)}\n`;
-	let reused = false;
-	let corruptRelease = false;
-	if (await pathExists(releaseDir)) {
-		try {
-			await verifyInstalledRelease(releaseDir, entries, receipt);
-			reused = true;
-		} catch {
-			corruptRelease = true;
-		}
-	}
-	if (!reused) {
-		const temporaryDir = join(root, `.install-${randomUUID()}`);
-		try {
-			await prepareInstalledRelease(temporaryDir, entries, receipt);
-			if (corruptRelease) {
-				try {
-					await verifyInstalledRelease(releaseDir, entries, receipt);
-					reused = true;
-				} catch {
-					await replaceCorruptRelease({
-						root,
-						releaseDir,
-						releaseName,
-						replacementDir: temporaryDir,
-						entries,
-						receipt,
-						...(options.onRepairQuarantined === undefined ? {} : { onQuarantined: options.onRepairQuarantined }),
-					});
-				}
-			} else {
-				try {
-					await rename(temporaryDir, releaseDir);
-				} catch (renameError) {
-					if (!isAlreadyExists(renameError)) throw renameError;
-					await verifyInstalledRelease(releaseDir, entries, receipt);
-					reused = true;
-				}
+	});
+	try {
+		await chmod(lockPath, 0o700);
+		await pruneInstallScratch(root);
+		const receipt = `${JSON.stringify(
+			{
+				schemaVersion: 1,
+				manifestSha256: options.expectedManifestSha256,
+				revision: manifest.revision,
+				protocolVersion: manifest.protocolVersion,
+				artifact,
+			},
+			undefined,
+			"\t",
+		)}\n`;
+		let reused = false;
+		let corruptRelease = false;
+		if (await pathExists(releaseDir)) {
+			try {
+				await verifyInstalledRelease(releaseDir, entries, receipt);
+				reused = true;
+			} catch {
+				corruptRelease = true;
 			}
+		}
+		if (!reused) {
+			const temporaryDir = join(root, `.install-${randomUUID()}`);
+			try {
+				await prepareInstalledRelease(temporaryDir, entries, receipt);
+				if (corruptRelease) {
+					try {
+						await verifyInstalledRelease(releaseDir, entries, receipt);
+						reused = true;
+					} catch {
+						await replaceCorruptRelease({
+							root,
+							releaseDir,
+							releaseName,
+							replacementDir: temporaryDir,
+							entries,
+							receipt,
+							...(options.onRepairQuarantined === undefined
+								? {}
+								: { onQuarantined: options.onRepairQuarantined }),
+						});
+					}
+				} else {
+					try {
+						await rename(temporaryDir, releaseDir);
+					} catch (renameError) {
+						if (!isAlreadyExists(renameError)) throw renameError;
+						await verifyInstalledRelease(releaseDir, entries, receipt);
+						reused = true;
+					}
+				}
+			} finally {
+				await rm(temporaryDir, { recursive: true, force: true });
+			}
+		}
+		await verifyInstalledRelease(releaseDir, entries, receipt);
+		const entrypoint = join(releaseDir, ...artifact.entrypoint.split("/"));
+		await switchCurrent(root, releaseDir);
+		return { releaseDir, entrypoint, reused };
+	} finally {
+		try {
+			await pruneInstallScratch(root);
 		} finally {
-			await rm(temporaryDir, { recursive: true, force: true });
+			await releaseLock();
 		}
 	}
-	await verifyInstalledRelease(releaseDir, entries, receipt);
-	const entrypoint = join(releaseDir, ...artifact.entrypoint.split("/"));
-	await switchCurrent(root, releaseDir);
-	return { releaseDir, entrypoint, reused };
 }
 
 export function parseWorkspaceArtifactIdentity(raw: string): WorkspaceArtifactIdentity {
@@ -441,6 +473,48 @@ async function currentTargetsRelease(root: string, releaseDir: string): Promise<
 	} catch (error) {
 		if (isMissing(error)) return false;
 		throw error;
+	}
+}
+
+async function validateInstallLockPath(path: string): Promise<void> {
+	try {
+		const stats = await lstat(path);
+		if (!stats.isDirectory() || stats.isSymbolicLink()) {
+			throw new Error(`Workspace install lock path is unsafe: ${path}`);
+		}
+		if (typeof process.getuid === "function" && stats.uid !== process.getuid()) {
+			throw new Error(`Workspace install lock path is not owned by the current user: ${path}`);
+		}
+	} catch (error) {
+		if (!isMissing(error)) throw error;
+	}
+}
+
+async function pruneInstallScratch(root: string): Promise<void> {
+	const current = join(root, "current");
+	let activeTarget: string | undefined;
+	try {
+		const stats = await lstat(current);
+		if (!stats.isSymbolicLink()) throw new Error(`Workspace current path is not a symlink: ${current}`);
+		activeTarget = resolve(root, await readlink(current));
+	} catch (error) {
+		if (!isMissing(error)) throw error;
+	}
+	for (const directory of [root, join(root, "releases")]) {
+		const prefix = directory === root ? ".candidate-" : ".repair-";
+		for (const name of await readdir(directory)) {
+			if (!name.startsWith(prefix)) continue;
+			const path = join(directory, name);
+			if (path === activeTarget) continue;
+			const stats = await lstat(path);
+			if (!stats.isDirectory() || stats.isSymbolicLink()) {
+				throw new Error(`Workspace install scratch path is unsafe: ${path}`);
+			}
+			if (typeof process.getuid === "function" && stats.uid !== process.getuid()) {
+				throw new Error(`Workspace install scratch path is not owned by the current user: ${path}`);
+			}
+			await rm(path, { recursive: true });
+		}
 	}
 }
 

@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, readlink, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -77,6 +77,20 @@ function writeOctal(buffer: Buffer, offset: number, length: number, value: numbe
 	const encoded = value.toString(8).padStart(length - 1, "0");
 	buffer.write(encoded, offset, length - 1, "ascii");
 	buffer[offset + length - 1] = 0;
+}
+
+function deferred(): { readonly promise: Promise<void>; resolve(): void } {
+	let settle: (() => void) | undefined;
+	const promise = new Promise<void>((resolve) => {
+		settle = resolve;
+	});
+	return {
+		promise,
+		resolve: () => {
+			if (settle === undefined) throw new Error("Deferred promise was not initialized");
+			settle();
+		},
+	};
 }
 
 function release(
@@ -183,6 +197,34 @@ describe("Workspace release archive", () => {
 });
 
 describe("Workspace release installation", () => {
+	test("rejects unsafe lock types and recovers an abandoned stale lock", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-workspace-install-"));
+		try {
+			const archive = createTarGzip([
+				{ path: ".pi-workspace-artifact.json", data: IDENTITY },
+				{ path: "bin/piw", data: "client", mode: 0o755 },
+			]);
+			const fixture = release(archive);
+			const options = {
+				root,
+				archive,
+				rawManifest: fixture.raw,
+				expectedManifestSha256: fixture.manifestSha256,
+				role: "client" as const,
+				platform: "darwin-arm64",
+			};
+			const lockPath = join(root, ".install-transaction-lock");
+			await writeFile(lockPath, "unsafe", "utf8");
+			await expect(installWorkspaceArtifact(options)).rejects.toThrow(/lock path is unsafe/);
+			await rm(lockPath);
+			await mkdir(lockPath);
+			await utimes(lockPath, new Date(0), new Date(0));
+			await expect(installWorkspaceArtifact(options)).resolves.toMatchObject({ reused: false });
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("does not alias identical artifact bytes across distinct verified manifests", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-workspace-install-"));
 		try {
@@ -244,6 +286,8 @@ describe("Workspace release installation", () => {
 				platform: "darwin-arm64",
 			});
 			await writeFile(installed.entrypoint, "corrupt", "utf8");
+			await mkdir(join(root, ".candidate-stale"));
+			await mkdir(join(root, "releases", ".repair-stale"));
 			const releaseName = `${fixture.manifestSha256}-${fixture.artifact.sha256}`;
 			let injected = false;
 			await expect(
@@ -265,6 +309,64 @@ describe("Workspace release installation", () => {
 			expect(injected).toBe(true);
 			expect(await readlink(join(root, "current"))).toBe(`releases/${releaseName}`);
 			expect(await readFile(join(root, "current", "bin", "piw"), "utf8")).toBe("corrupt");
+			expect((await readdir(root)).some((name) => name.startsWith(".candidate-"))).toBe(false);
+			expect((await readdir(join(root, "releases"))).some((name) => name.startsWith(".repair-"))).toBe(false);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("serializes concurrent repairs without ever dangling current", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-workspace-install-"));
+		try {
+			const archive = createTarGzip([
+				{ path: ".pi-workspace-artifact.json", data: IDENTITY },
+				{ path: "bin/piw", data: "client", mode: 0o755 },
+			]);
+			const fixture = release(archive);
+			const installed = await installWorkspaceArtifact({
+				root,
+				archive,
+				rawManifest: fixture.raw,
+				expectedManifestSha256: fixture.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
+			});
+			await chmod(installed.entrypoint, 0o600);
+			const repairEntered = deferred();
+			const continueRepair = deferred();
+			const first = installWorkspaceArtifact({
+				root,
+				archive,
+				rawManifest: fixture.raw,
+				expectedManifestSha256: fixture.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
+				onRepairQuarantined: async () => {
+					repairEntered.resolve();
+					await continueRepair.promise;
+				},
+			});
+			await repairEntered.promise;
+			const second = installWorkspaceArtifact({
+				root,
+				archive,
+				rawManifest: fixture.raw,
+				expectedManifestSha256: fixture.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
+			});
+			for (let attempt = 0; attempt < 50; attempt += 1) {
+				expect(await readlink(join(root, "current"))).toMatch(/^releases\//u);
+				expect(await readFile(join(root, "current", "bin", "piw"), "utf8")).toBe("client");
+				await new Promise<void>((resolve) => setTimeout(resolve, 1));
+			}
+			continueRepair.resolve();
+			const [repaired, reused] = await Promise.all([first, second]);
+			expect(repaired.reused).toBe(false);
+			expect(reused.reused).toBe(true);
+			expect(await readFile(join(root, "current", "bin", "piw"), "utf8")).toBe("client");
+			expect((await stat(join(root, "current", "bin", "piw"))).mode & 0o777).toBe(0o700);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -336,6 +438,20 @@ describe("Workspace release installation", () => {
 			expect(await readlink(join(root, "current"))).toBe(`releases/${secondReleaseName}`);
 			expect((await readdir(join(root, "releases"))).sort()).toEqual([firstReleaseName, secondReleaseName].sort());
 
+			await chmod(updated.entrypoint, 0o600);
+			const modeRepaired = await installWorkspaceArtifact({
+				root,
+				archive: secondArchive,
+				rawManifest: second.raw,
+				expectedManifestSha256: second.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
+			});
+			expect(modeRepaired.reused).toBe(false);
+			expect((await stat(modeRepaired.entrypoint)).mode & 0o777).toBe(0o700);
+
+			await mkdir(join(root, ".candidate-stale"));
+			await mkdir(join(root, "releases", ".repair-stale"));
 			await writeFile(updated.entrypoint, "tampered", "utf8");
 			const repaired = await installWorkspaceArtifact({
 				root,
@@ -347,7 +463,9 @@ describe("Workspace release installation", () => {
 			});
 			expect(repaired.reused).toBe(false);
 			expect(await readFile(repaired.entrypoint, "utf8")).toBe("second");
-			expect((await readdir(join(root, "quarantine"))).length).toBe(1);
+			expect((await readdir(join(root, "quarantine"))).length).toBe(2);
+			expect((await readdir(root)).some((name) => name.startsWith(".candidate-"))).toBe(false);
+			expect((await readdir(join(root, "releases"))).some((name) => name.startsWith(".repair-"))).toBe(false);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

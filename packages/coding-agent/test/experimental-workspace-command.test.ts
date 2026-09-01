@@ -294,11 +294,20 @@ describe("workspace remote paths and command construction", () => {
 		expect(() => remoteCommands.writeMarker(paths(), "not-a-revision")).toThrow(/Invalid revision/);
 	});
 
-	test("builds a transfer-verified standalone install without trusting archive paths from the remote tar", () => {
+	test("builds a locked, transfer-verified standalone install without trusting remote tar paths", () => {
 		const manifestDigest = "b".repeat(64);
 		const artifactDigest = "a".repeat(64);
 		const installed = buildInstalledWorkspaceRemotePaths(HOME, REVISION, manifestDigest, artifactDigest);
 		const command = remoteCommands.installArtifact(installed, artifactDigest);
+		const reuse = remoteCommands.isInstalled(installed, artifactDigest);
+		const reuseLocked = reuse.indexOf("flock -w 120 9");
+		const reuseModeVerified = reuse.indexOf(`test -x ${installed.cliEntry}`);
+		const reuseActivated = reuse.indexOf(`ln -s releases/${manifestDigest}-${artifactDigest}`);
+		expect(reuseLocked).toBeGreaterThan(-1);
+		expect(reuseModeVerified).toBeGreaterThan(reuseLocked);
+		expect(reuseActivated).toBeGreaterThan(reuseModeVerified);
+		expect(reuse).toContain(`test -x ${installed.revisionDir}/bin/esbuild`);
+		expect(reuse).toContain("trap cleanup_workspace_reuse EXIT HUP INT TERM");
 		expect(command).toContain(
 			`sha256sum ${installed.shareRoot}/.install-${manifestDigest}-${artifactDigest}-$$.tar.gz`,
 		);
@@ -306,19 +315,34 @@ describe("workspace remote paths and command construction", () => {
 		expect(command).toContain(".pi-workspace-artifact.json");
 		expect(command).toContain("sha256sum > .tree.sha256");
 		expect(command).toContain(`[ ! -L ${installed.shareRoot}/current ]`);
+		const lockAcquired = command.indexOf(`flock -w 120 9`);
+		const archiveReceived = command.indexOf(`cat > ${installed.shareRoot}/.install-`);
+		expect(lockAcquired).toBeGreaterThan(-1);
+		expect(archiveReceived).toBeGreaterThan(lockAcquired);
+		expect(command).toContain("trap cleanup_workspace_install EXIT HUP INT TERM");
+		expect(command).toContain(`test -f ${installed.shareRoot}/.install-transaction.lock`);
+		expect(command).toContain(`stat -c %u ${installed.shareRoot}/.install-transaction.lock`);
+		expect(command).toContain(`for scratch in ${installed.shareRoot}/.candidate-*`);
+		expect(command).toContain(`${installed.shareRoot}/releases/.repair-*`);
 		const candidate = `${installed.shareRoot}/.candidate-${manifestDigest}-${artifactDigest}-$$`;
 		const fallback = `${installed.shareRoot}/releases/.repair-${manifestDigest}-${artifactDigest}-$$`;
 		const quarantine = `${installed.shareRoot}/quarantine/${manifestDigest}-${artifactDigest}-$$`;
+		const candidateModeVerified = command.indexOf(`test -x ${candidate}/bin/pi-workspace-server`);
 		const candidateVerified = command.indexOf(`cd ${candidate} && test -z`);
 		const fallbackActivated = command.indexOf(`ln -s releases/.repair-${manifestDigest}-${artifactDigest}-$$`);
 		const quarantined = command.indexOf(`mv -T ${installed.revisionDir} ${quarantine}`);
 		const replacementActivated = command.indexOf(`mv -T ${candidate} ${installed.revisionDir}`);
-		expect(candidateVerified).toBeGreaterThan(-1);
+		expect(candidateModeVerified).toBeGreaterThan(-1);
+		expect(candidateVerified).toBeGreaterThan(candidateModeVerified);
 		expect(fallbackActivated).toBeGreaterThan(candidateVerified);
 		expect(quarantined).toBeGreaterThan(fallbackActivated);
 		expect(replacementActivated).toBeGreaterThan(quarantined);
 		expect(command).toContain(`rm -rf ${installed.revisionDir} && mv -T ${quarantine} ${installed.revisionDir}`);
 		expect(command).toContain(`rm -rf ${fallback}`);
+		const targetModeVerified = command.indexOf(`test -x ${installed.revisionDir}/bin/pi-workspace-server`);
+		const targetActivated = command.indexOf(`ln -s releases/${manifestDigest}-${artifactDigest}`);
+		expect(targetModeVerified).toBeGreaterThan(-1);
+		expect(targetActivated).toBeGreaterThan(targetModeVerified);
 	});
 
 	test("builds stop and purge commands that only touch MVP-owned paths", () => {
