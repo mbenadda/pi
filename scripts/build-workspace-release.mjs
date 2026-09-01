@@ -1,25 +1,31 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
+	renameSync,
 	rmSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { PROTOCOL_VERSION } from "@earendil-works/pi-protocol";
 
 const REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const PLATFORM_PATTERN = /^(darwin|linux)-(arm64|x64)$/u;
+const ARCHIVE_OUTPUT_PATTERN = /^pi-workspace-(client|server)-(darwin|linux)-(arm64|x64)-[0-9a-f]{40}\.tar\.gz$/u;
 const TAR_BLOCK_BYTES = 512;
 const DEFAULT_PLUGIN_DIRECTORY = "packages/coding-agent/examples/plugins/pi-example-plugin";
+const DEFAULT_PLUGIN_FILES = ["README.md", "package.json", "src/contract.ts", "src/session.ts", "src/tui.ts"];
+const ARTIFACT_IDENTITY_PATH = ".pi-workspace-artifact.json";
 
 export function sha256(data) {
 	return createHash("sha256").update(data).digest("hex");
@@ -28,9 +34,21 @@ export function sha256(data) {
 export function createWorkspaceTarGzip(files) {
 	const blocks = [];
 	const directories = new Set();
+	const paths = new Set();
 	for (const file of files) {
+		if (paths.has(file.path)) throw new Error(`Duplicate Workspace artifact path: ${file.path}`);
+		paths.add(file.path);
 		const parts = file.path.split("/");
-		for (let index = 1; index < parts.length; index += 1) directories.add(`${parts.slice(0, index).join("/")}/`);
+		for (let index = 1; index < parts.length; index += 1) {
+			const directory = `${parts.slice(0, index).join("/")}/`;
+			if (paths.has(directory.slice(0, -1))) {
+				throw new Error(`Workspace artifact file conflicts with directory: ${directory}`);
+			}
+			directories.add(directory);
+		}
+	}
+	for (const path of paths) {
+		if (directories.has(`${path}/`)) throw new Error(`Workspace artifact file conflicts with directory: ${path}`);
 	}
 	for (const path of [...directories].sort()) blocks.push(createTarHeader(path, 0, 0o700, "5"));
 	for (const file of [...files].sort((left, right) => left.path.localeCompare(right.path))) {
@@ -67,13 +85,19 @@ export function buildWorkspaceRelease(options) {
 		if (!statSync(binaryPath).isFile()) throw new Error(`Workspace runtime is not a file: ${binaryPath}`);
 		const entrypoint = "bin/pi-workspace-server";
 		const esbuildPath = join(dirname(binaryPath), "esbuild");
-		if (!existsSync(esbuildPath) || !statSync(esbuildPath).isFile()) {
+		if (
+			!existsSync(esbuildPath) ||
+			!lstatSync(esbuildPath).isFile() ||
+			lstatSync(esbuildPath).isSymbolicLink()
+		) {
 			throw new Error(`Workspace server requires a pinned esbuild binary next to its runtime: ${esbuildPath}`);
 		}
+		const identity = artifactIdentity(options.revision, "server", input.platform, entrypoint);
 		const archive = createWorkspaceTarGzip([
+			{ path: ARTIFACT_IDENTITY_PATH, data: Buffer.from(identity), executable: false },
 			{ path: entrypoint, data: readFileSync(binaryPath), executable: true },
 			{ path: "bin/esbuild", data: readFileSync(esbuildPath), executable: true },
-			...readTree(pluginRoot, "plugins/pi-example-plugin"),
+			...readTrackedPlugin(repoRoot, pluginRoot, "plugins/pi-example-plugin"),
 			...readChordRuntime(repoRoot),
 			...readPluginApiRuntime(repoRoot),
 		]);
@@ -105,7 +129,9 @@ export function buildWorkspaceRelease(options) {
 		const clientFiles = readTree(dirname(binaryPath), "bin").filter(
 			(file) => file.path !== `bin/${basename(binaryPath)}`,
 		);
+		const identity = artifactIdentity(options.revision, "client", input.platform, entrypoint, sha256(rawServerManifest));
 		const archive = createWorkspaceTarGzip([
+			{ path: ARTIFACT_IDENTITY_PATH, data: Buffer.from(identity), executable: false },
 			{ path: entrypoint, data: readFileSync(binaryPath), executable: true },
 			...clientFiles,
 			...readChordRuntime(repoRoot),
@@ -150,15 +176,105 @@ export function buildWorkspaceRelease(options) {
 	};
 	const rawManifest = `${JSON.stringify(manifest, undefined, "\t")}\n`;
 	const outDir = resolve(options.outDir);
-	if (existsSync(outDir)) {
-		if (!options.force) throw new Error(`Output directory already exists: ${outDir}`);
-		rmSync(outDir, { recursive: true, force: true });
+	mkdirSync(dirname(outDir), { recursive: true, mode: 0o700 });
+	assertSafeOutputDirectory(outDir, repoRoot, options.force);
+	const temporaryDir = join(dirname(outDir), `.${basename(outDir)}.build-${randomUUID()}`);
+	const replacedDir = join(dirname(outDir), `.${basename(outDir)}.replaced-${randomUUID()}`);
+	try {
+		mkdirSync(temporaryDir, { mode: 0o700 });
+		for (const { archive, artifact } of prepared) {
+			writeFileSync(join(temporaryDir, artifact.file), archive, { mode: 0o600, flag: "wx" });
+		}
+		writeFileSync(join(temporaryDir, "manifest.json"), rawManifest, { mode: 0o600, flag: "wx" });
+		writeFileSync(join(temporaryDir, "manifest.sha256"), `${sha256(rawManifest)}  manifest.json\n`, {
+			mode: 0o600,
+			flag: "wx",
+		});
+		if (existsSync(outDir)) renameSync(outDir, replacedDir);
+		try {
+			renameSync(temporaryDir, outDir);
+		} catch (error) {
+			if (existsSync(replacedDir)) renameSync(replacedDir, outDir);
+			throw error;
+		}
+		rmSync(replacedDir, { recursive: true, force: true });
+	} finally {
+		rmSync(temporaryDir, { recursive: true, force: true });
 	}
-	mkdirSync(outDir, { recursive: true, mode: 0o700 });
-	for (const { archive, artifact } of prepared) writeFileSync(join(outDir, artifact.file), archive, { mode: 0o600 });
-	writeFileSync(join(outDir, "manifest.json"), rawManifest, { mode: 0o600 });
-	writeFileSync(join(outDir, "manifest.sha256"), `${sha256(rawManifest)}  manifest.json\n`, { mode: 0o600 });
 	return manifest;
+}
+
+function artifactIdentity(revision, role, platform, entrypoint, bundledManifestSha256) {
+	return `${JSON.stringify(
+		{
+			schemaVersion: 1,
+			revision,
+			protocolVersion: PROTOCOL_VERSION,
+			role,
+			platform,
+			entrypoint,
+			...(bundledManifestSha256 === undefined ? {} : { bundledManifestSha256 }),
+		},
+		undefined,
+		"\t",
+	)}\n`;
+}
+
+function readTrackedPlugin(repoRoot, pluginRoot, destination) {
+	const tracked = execFileSync("git", ["-C", repoRoot, "ls-files", "--", DEFAULT_PLUGIN_DIRECTORY], {
+		encoding: "utf8",
+	})
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((path) => path.slice(`${DEFAULT_PLUGIN_DIRECTORY}/`.length))
+		.sort();
+	if (JSON.stringify(tracked) !== JSON.stringify(DEFAULT_PLUGIN_FILES)) {
+		throw new Error(`Default Workspace plugin tracked files do not match the packaging allowlist: ${tracked.join(", ")}`);
+	}
+	return DEFAULT_PLUGIN_FILES.map((child) => {
+		const path = join(pluginRoot, ...child.split("/"));
+		const stats = lstatSync(path);
+		if (!stats.isFile() || stats.isSymbolicLink()) throw new Error(`Unsupported file in default Workspace plugin: ${path}`);
+		return { path: `${destination}/${child}`, data: readFileSync(path), executable: false };
+	});
+}
+
+function assertSafeOutputDirectory(outDir, repoRoot, force) {
+	const actualOutDir = join(realpathSync(dirname(outDir)), basename(outDir));
+	const actualRepoRoot = realpathSync(repoRoot);
+	if (
+		!isAbsolute(outDir) ||
+		outDir === dirname(outDir) ||
+		actualOutDir === actualRepoRoot ||
+		actualRepoRoot.startsWith(`${actualOutDir}${sep}`)
+	) {
+		throw new Error(`Unsafe Workspace release output directory: ${outDir}`);
+	}
+	if (!existsSync(outDir)) return;
+	const stats = lstatSync(outDir);
+	if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error(`Unsafe Workspace release output path: ${outDir}`);
+	if (!force) throw new Error(`Output directory already exists: ${outDir}`);
+	const names = readdirSync(outDir).sort();
+	if (
+		!names.includes("manifest.json") ||
+		!names.includes("manifest.sha256") ||
+		names.some((name) =>
+			name !== "manifest.json" && name !== "manifest.sha256" ? !ARCHIVE_OUTPUT_PATTERN.test(name) : false,
+		)
+	) {
+		throw new Error(`Refusing to replace an unrecognized Workspace release directory: ${outDir}`);
+	}
+	for (const name of names) {
+		const entry = lstatSync(join(outDir, name));
+		if (!entry.isFile() || entry.isSymbolicLink()) {
+			throw new Error(`Refusing to replace an unsafe Workspace release directory: ${outDir}`);
+		}
+	}
+	const rawManifest = readFileSync(join(outDir, "manifest.json"), "utf8");
+	if (readFileSync(join(outDir, "manifest.sha256"), "utf8") !== `${sha256(rawManifest)}  manifest.json\n`) {
+		throw new Error(`Refusing to replace a Workspace release with an invalid manifest checksum: ${outDir}`);
+	}
 }
 
 function readPluginApiRuntime(_repoRoot) {
@@ -202,7 +318,8 @@ function readTree(root, destination) {
 	const visit = (directory) => {
 		for (const name of readdirSync(directory).sort()) {
 			const path = join(directory, name);
-			const stats = statSync(path);
+			const stats = lstatSync(path);
+			if (stats.isSymbolicLink()) throw new Error(`Unsupported symlink in Workspace release input: ${path}`);
 			if (stats.isDirectory()) visit(path);
 			else if (stats.isFile()) {
 				const child = relative(root, path).split(sep).join("/");

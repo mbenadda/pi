@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, readlink, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, readlink, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -16,6 +16,18 @@ import {
 } from "../src/experimental/workspace-install.ts";
 
 const REVISION = "0123456789abcdef0123456789abcdef01234567";
+const IDENTITY = `${JSON.stringify(
+	{
+		schemaVersion: 1,
+		revision: REVISION,
+		protocolVersion: PROTOCOL_VERSION,
+		role: "client",
+		platform: "darwin-arm64",
+		entrypoint: "bin/piw",
+	},
+	undefined,
+	"\t",
+)}\n`;
 
 interface FixtureEntry {
 	readonly path: string;
@@ -112,16 +124,12 @@ describe("Workspace release manifest", () => {
 		const archive = createTarGzip([{ path: "bin/piw", data: "client" }]);
 		const fixture = release(archive);
 		expect(() => parseWorkspaceReleaseManifest(fixture.raw, "0".repeat(64))).toThrow(/manifest checksum mismatch/);
-		expect(() => parseWorkspaceReleaseManifest(fixture.raw.replace(REVISION, "not-a-revision"))).toThrow(
-			/invalid revision/,
-		);
-		expect(() =>
-			parseWorkspaceReleaseManifest(
-				fixture.raw.replace(`"protocolVersion": ${PROTOCOL_VERSION}`, '"protocolVersion": 0'),
-			),
-		).toThrow(/incompatible/);
+		const invalidRevision = fixture.raw.replace(REVISION, "not-a-revision");
+		expect(() => parseWorkspaceReleaseManifest(invalidRevision, sha256(invalidRevision))).toThrow(/invalid revision/);
+		const invalidProtocol = fixture.raw.replace(`"protocolVersion": ${PROTOCOL_VERSION}`, '"protocolVersion": 0');
+		expect(() => parseWorkspaceReleaseManifest(invalidProtocol, sha256(invalidProtocol))).toThrow(/incompatible/);
 		const duplicate = JSON.stringify({ ...fixture.manifest, artifacts: [fixture.artifact, fixture.artifact] });
-		expect(() => parseWorkspaceReleaseManifest(duplicate)).toThrow(/duplicate artifact/);
+		expect(() => parseWorkspaceReleaseManifest(duplicate, sha256(duplicate))).toThrow(/duplicate artifact/);
 	});
 });
 
@@ -150,6 +158,14 @@ describe("Workspace release archive", () => {
 		},
 	);
 
+	test("rejects file and directory path collisions", () => {
+		const archive = createTarGzip([
+			{ path: "bin", data: "file" },
+			{ path: "bin/piw", data: "nested" },
+		]);
+		expect(() => inspectWorkspaceArchive(archive)).toThrow(/file conflicts with directory/);
+	});
+
 	test("rejects links rather than relying on tar extraction semantics", () => {
 		const archive = createTarGzip([{ path: "bin/piw", type: "2", data: "../../outside" }]);
 		expect(() => inspectWorkspaceArchive(archive)).toThrow(/Unsupported Workspace archive entry type/);
@@ -157,10 +173,55 @@ describe("Workspace release archive", () => {
 });
 
 describe("Workspace release installation", () => {
+	test("does not alias identical artifact bytes across distinct verified manifests", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-workspace-install-"));
+		try {
+			const archive = createTarGzip([
+				{ path: ".pi-workspace-artifact.json", data: IDENTITY },
+				{ path: "bin/piw", data: "client", mode: 0o755 },
+			]);
+			const first = release(archive);
+			const second = release(archive, { file: "renamed-client.tar.gz" });
+			const installedFirst = await installWorkspaceArtifact({
+				root,
+				archive,
+				rawManifest: first.raw,
+				expectedManifestSha256: first.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
+			});
+			const installedSecond = await installWorkspaceArtifact({
+				root,
+				archive,
+				rawManifest: second.raw,
+				expectedManifestSha256: second.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
+			});
+			expect(installedSecond.reused).toBe(false);
+			expect(installedSecond.releaseDir).not.toBe(installedFirst.releaseDir);
+			expect((await readdir(join(root, "releases"))).length).toBe(2);
+			const changedRevision = second.raw.replace(REVISION, "fedcba9876543210fedcba9876543210fedcba98");
+			await expect(
+				installWorkspaceArtifact({
+					root,
+					archive,
+					rawManifest: changedRevision,
+					expectedManifestSha256: sha256(changedRevision),
+					role: "client",
+					platform: "darwin-arm64",
+				}),
+			).rejects.toThrow(/identity does not match/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("installs content-addressed, switches current atomically, and retains rollback releases", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-workspace-install-"));
 		try {
 			const firstArchive = createTarGzip([
+				{ path: ".pi-workspace-artifact.json", data: IDENTITY },
 				{ path: "bin/", type: "5" },
 				{ path: "bin/piw", data: "first", mode: 0o755 },
 			]);
@@ -168,27 +229,31 @@ describe("Workspace release installation", () => {
 			const installed = await installWorkspaceArtifact({
 				root,
 				archive: firstArchive,
-				artifact: first.artifact,
-				manifest: first.manifest,
-				manifestSha256: first.manifestSha256,
+				rawManifest: first.raw,
+				expectedManifestSha256: first.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
 			});
 			expect(installed.reused).toBe(false);
 			expect(await readFile(installed.entrypoint, "utf8")).toBe("first");
 			expect((await stat(root)).mode & 0o777).toBe(0o700);
 			expect((await stat(installed.entrypoint)).mode & 0o777).toBe(0o700);
 			expect((await stat(join(installed.releaseDir, "install.json"))).mode & 0o777).toBe(0o600);
-			expect(await readlink(join(root, "current"))).toBe(`releases/${first.artifact.sha256}`);
+			const firstReleaseName = `${first.manifestSha256}-${first.artifact.sha256}`;
+			expect(await readlink(join(root, "current"))).toBe(`releases/${firstReleaseName}`);
 
 			const repeated = await installWorkspaceArtifact({
 				root,
 				archive: firstArchive,
-				artifact: first.artifact,
-				manifest: first.manifest,
-				manifestSha256: first.manifestSha256,
+				rawManifest: first.raw,
+				expectedManifestSha256: first.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
 			});
 			expect(repeated.reused).toBe(true);
 
 			const secondArchive = createTarGzip([
+				{ path: ".pi-workspace-artifact.json", data: IDENTITY },
 				{ path: "bin/", type: "5" },
 				{ path: "bin/piw", data: "second", mode: 0o755 },
 			]);
@@ -197,25 +262,39 @@ describe("Workspace release installation", () => {
 				installWorkspaceArtifact({
 					root,
 					archive: Buffer.from("corrupt"),
-					artifact: second.artifact,
-					manifest: second.manifest,
-					manifestSha256: second.manifestSha256,
+					rawManifest: second.raw,
+					expectedManifestSha256: second.manifestSha256,
+					role: "client",
+					platform: "darwin-arm64",
 				}),
 			).rejects.toThrow(/size mismatch/);
-			expect(await readlink(join(root, "current"))).toBe(`releases/${first.artifact.sha256}`);
+			expect(await readlink(join(root, "current"))).toBe(`releases/${firstReleaseName}`);
 
 			const updated = await installWorkspaceArtifact({
 				root,
 				archive: secondArchive,
-				artifact: second.artifact,
-				manifest: second.manifest,
-				manifestSha256: second.manifestSha256,
+				rawManifest: second.raw,
+				expectedManifestSha256: second.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
 			});
 			expect(await readFile(updated.entrypoint, "utf8")).toBe("second");
-			expect(await readlink(join(root, "current"))).toBe(`releases/${second.artifact.sha256}`);
-			expect((await readdir(join(root, "releases"))).sort()).toEqual(
-				[first.artifact.sha256, second.artifact.sha256].sort(),
-			);
+			const secondReleaseName = `${second.manifestSha256}-${second.artifact.sha256}`;
+			expect(await readlink(join(root, "current"))).toBe(`releases/${secondReleaseName}`);
+			expect((await readdir(join(root, "releases"))).sort()).toEqual([firstReleaseName, secondReleaseName].sort());
+
+			await writeFile(updated.entrypoint, "tampered", "utf8");
+			const repaired = await installWorkspaceArtifact({
+				root,
+				archive: secondArchive,
+				rawManifest: second.raw,
+				expectedManifestSha256: second.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
+			});
+			expect(repaired.reused).toBe(false);
+			expect(await readFile(repaired.entrypoint, "utf8")).toBe("second");
+			expect((await readdir(join(root, "quarantine"))).length).toBe(1);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
