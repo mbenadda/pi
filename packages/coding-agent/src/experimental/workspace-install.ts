@@ -171,6 +171,8 @@ export async function installWorkspaceArtifact(options: {
 	readonly platform: string;
 	/** Test-only fault seam invoked after the corrupt release is quarantined and before replacement activation. */
 	readonly onRepairQuarantined?: () => Promise<void>;
+	/** Test-only fault seam invoked before a failed repair is rolled back. */
+	readonly onRepairRollback?: () => Promise<void>;
 }): Promise<InstalledWorkspaceRelease> {
 	const root = resolve(options.root);
 	if (root === "/") throw new Error("Workspace install root cannot be the filesystem root");
@@ -202,9 +204,12 @@ export async function installWorkspaceArtifact(options: {
 			maxRetryTime: INSTALL_LOCK_WAIT_MS,
 		},
 	});
+	const protectedScratch = new Set<string>();
+	let transactionResult: InstalledWorkspaceRelease | undefined;
+	let transactionError: unknown;
 	try {
 		await chmod(lockPath, 0o700);
-		await pruneInstallScratch(root);
+		await pruneInstallScratch(root, protectedScratch);
 		const receipt = `${JSON.stringify(
 			{
 				schemaVersion: 1,
@@ -242,9 +247,11 @@ export async function installWorkspaceArtifact(options: {
 							replacementDir: temporaryDir,
 							entries,
 							receipt,
+							protectedScratch,
 							...(options.onRepairQuarantined === undefined
 								? {}
 								: { onQuarantined: options.onRepairQuarantined }),
+							...(options.onRepairRollback === undefined ? {} : { onRollback: options.onRepairRollback }),
 						});
 					}
 				} else {
@@ -263,14 +270,34 @@ export async function installWorkspaceArtifact(options: {
 		await verifyInstalledRelease(releaseDir, entries, receipt);
 		const entrypoint = join(releaseDir, ...artifact.entrypoint.split("/"));
 		await switchCurrent(root, releaseDir);
-		return { releaseDir, entrypoint, reused };
-	} finally {
-		try {
-			await pruneInstallScratch(root);
-		} finally {
-			await releaseLock();
-		}
+		transactionResult = { releaseDir, entrypoint, reused };
+	} catch (error) {
+		transactionError = error;
 	}
+	const cleanupErrors: unknown[] = [];
+	try {
+		await pruneInstallScratch(root, protectedScratch);
+	} catch (error) {
+		cleanupErrors.push(error);
+	}
+	try {
+		await releaseLock();
+	} catch (error) {
+		cleanupErrors.push(error);
+	}
+	if (transactionError !== undefined) {
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError(
+				[transactionError, ...cleanupErrors],
+				"Workspace install transaction and cleanup failed",
+			);
+		}
+		throw transactionError;
+	}
+	if (cleanupErrors.length === 1) throw cleanupErrors[0];
+	if (cleanupErrors.length > 1) throw new AggregateError(cleanupErrors, "Workspace install cleanup failed");
+	if (transactionResult === undefined) throw new Error("Workspace install transaction produced no result");
+	return transactionResult;
 }
 
 export function parseWorkspaceArtifactIdentity(raw: string): WorkspaceArtifactIdentity {
@@ -415,16 +442,20 @@ async function replaceCorruptRelease(options: {
 	readonly replacementDir: string;
 	readonly entries: readonly TarEntry[];
 	readonly receipt: string;
+	readonly protectedScratch: Set<string>;
 	readonly onQuarantined?: () => Promise<void>;
+	readonly onRollback?: () => Promise<void>;
 }): Promise<void> {
 	const active = await currentTargetsRelease(options.root, options.releaseDir);
 	const fallbackDir = join(options.root, "releases", `.repair-${options.releaseName}-${randomUUID()}`);
 	let fallbackPrepared = false;
+	let fallbackMayBeRemoved = false;
 	let quarantinePath: string | undefined;
 	try {
 		if (active) {
 			await prepareInstalledRelease(fallbackDir, options.entries, options.receipt);
 			fallbackPrepared = true;
+			options.protectedScratch.add(fallbackDir);
 			await switchCurrent(options.root, fallbackDir);
 		}
 		quarantinePath = await quarantineRelease(options.root, options.releaseDir, options.releaseName);
@@ -432,8 +463,10 @@ async function replaceCorruptRelease(options: {
 		await rename(options.replacementDir, options.releaseDir);
 		await verifyInstalledRelease(options.releaseDir, options.entries, options.receipt);
 		await switchCurrent(options.root, options.releaseDir);
+		fallbackMayBeRemoved = true;
 	} catch (error) {
 		try {
+			await options.onRollback?.();
 			if (quarantinePath !== undefined) {
 				if (await pathExists(options.releaseDir)) {
 					const quarantine = dirname(quarantinePath);
@@ -444,14 +477,29 @@ async function replaceCorruptRelease(options: {
 				}
 				await rename(quarantinePath, options.releaseDir);
 			}
-			if (active) await switchCurrent(options.root, options.releaseDir);
+			const restored = await lstat(options.releaseDir);
+			if (
+				!restored.isDirectory() ||
+				restored.isSymbolicLink() ||
+				(typeof process.getuid === "function" && restored.uid !== process.getuid())
+			) {
+				throw new Error(`Workspace restored release path is unsafe: ${options.releaseDir}`);
+			}
+			if (active) {
+				await switchCurrent(options.root, options.releaseDir);
+				if (!(await currentTargetsRelease(options.root, options.releaseDir))) {
+					throw new Error("Workspace restored release is not active");
+				}
+			}
+			fallbackMayBeRemoved = true;
 		} catch (rollbackError) {
 			throw new AggregateError([error, rollbackError], "Workspace release repair and rollback failed");
 		}
 		throw error;
 	} finally {
-		if (fallbackPrepared && !(await currentTargetsRelease(options.root, fallbackDir))) {
+		if (fallbackPrepared && fallbackMayBeRemoved && !(await currentTargetsRelease(options.root, fallbackDir))) {
 			await rm(fallbackDir, { recursive: true, force: true });
+			options.protectedScratch.delete(fallbackDir);
 		}
 	}
 }
@@ -490,7 +538,7 @@ async function validateInstallLockPath(path: string): Promise<void> {
 	}
 }
 
-async function pruneInstallScratch(root: string): Promise<void> {
+async function pruneInstallScratch(root: string, protectedScratch: ReadonlySet<string>): Promise<void> {
 	const current = join(root, "current");
 	let activeTarget: string | undefined;
 	try {
@@ -501,21 +549,34 @@ async function pruneInstallScratch(root: string): Promise<void> {
 		if (!isMissing(error)) throw error;
 	}
 	for (const directory of [root, join(root, "releases")]) {
-		const prefix = directory === root ? ".candidate-" : ".repair-";
 		for (const name of await readdir(directory)) {
-			if (!name.startsWith(prefix)) continue;
+			const kind = scratchKind(directory === root, name);
+			if (kind === undefined) continue;
 			const path = join(directory, name);
-			if (path === activeTarget) continue;
+			if (path === activeTarget || protectedScratch.has(path)) continue;
 			const stats = await lstat(path);
-			if (!stats.isDirectory() || stats.isSymbolicLink()) {
-				throw new Error(`Workspace install scratch path is unsafe: ${path}`);
-			}
+			const validType =
+				kind === "link"
+					? stats.isSymbolicLink()
+					: !stats.isSymbolicLink() && (stats.isDirectory() || (kind === "install" && stats.isFile()));
+			if (!validType) throw new Error(`Workspace install scratch path is unsafe: ${path}`);
 			if (typeof process.getuid === "function" && stats.uid !== process.getuid()) {
 				throw new Error(`Workspace install scratch path is not owned by the current user: ${path}`);
 			}
-			await rm(path, { recursive: true });
+			await rm(path, { recursive: stats.isDirectory(), force: true });
 		}
 	}
+}
+
+function scratchKind(root: boolean, name: string): "directory" | "install" | "link" | undefined {
+	if (!root) return name.startsWith(".repair-") ? "directory" : undefined;
+	if (name === ".install-transaction-lock") return undefined;
+	if (name.startsWith(".install-")) return "install";
+	if (name.startsWith(".candidate-")) return "directory";
+	if (name.startsWith(".current-") || name.startsWith(".reuse-current-") || name.startsWith(".rollback-current-")) {
+		return "link";
+	}
+	return undefined;
 }
 
 async function pathExists(path: string): Promise<boolean> {

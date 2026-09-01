@@ -30,7 +30,9 @@ import {
  */
 
 const MIN_REMOTE_NODE_VERSION = [22, 19, 0];
-const SSH_EXEC_TIMEOUT_MS = 30_000;
+export const SSH_EXEC_TIMEOUT_MS = 30_000;
+export const REMOTE_INSTALL_LOCK_WAIT_MS = 20_000;
+const REMOTE_INSTALL_LOCK_STALE_SECONDS = 300;
 const STAGE_BUILD_TIMEOUT_MS = 30 * 60_000;
 const SERVER_START_TIMEOUT_MS = 180_000;
 const SERVER_STOP_TIMEOUT_MS = 30_000;
@@ -194,7 +196,7 @@ export async function sshExec(
 	timer.unref();
 	const code = await new Promise<number>((resolve, reject) => {
 		child.once("error", reject);
-		child.once("exit", (exitCode) => resolve(exitCode ?? 0));
+		child.once("exit", (exitCode) => resolve(exitCode ?? 1));
 	});
 	clearTimeout(timer);
 	return { code, stdout, stderr };
@@ -228,6 +230,71 @@ export function resolveLocalRepository(): LocalRepository {
 	const revision = revisionResult.stdout.trim();
 	if (!REVISION_PATTERN.test(revision)) throw new Error(`Unexpected Git revision: ${revision}`);
 	return { root, revision };
+}
+
+function remoteInstallTransactionShell(shareRoot: string): string {
+	const lock = `${shareRoot}/.install-transaction-lock`;
+	const waitSeconds = REMOTE_INSTALL_LOCK_WAIT_MS / 1_000;
+	return (
+		`require_install_tools() { for piw_tool in stat date find sha256sum sort xargs cmp readlink mv tar mkdir chmod rm cp ln touch sleep id cut cat; do` +
+		` command -v "$piw_tool" >/dev/null 2>&1 || { printf 'piw: required remote install tool missing: %s\\n' "$piw_tool" >&2; return 1; }; done;` +
+		` stat -c %u ${shareRoot} >/dev/null 2>&1 || { printf 'piw: remote install requires GNU-compatible stat\\n' >&2; return 1; }; };` +
+		` acquire_install_lock() { piw_lock_attempt=0; while :; do` +
+		` if (umask 077; mkdir ${lock}) 2>/dev/null; then` +
+		` printf %s "$$" > ${lock}/owner && chmod 600 ${lock}/owner || { rm -rf ${lock}; return 1; }; chmod 700 ${lock}; break; fi;` +
+		` if ! test -d ${lock} || test -L ${lock}; then` +
+		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then continue; fi;` +
+		` printf 'piw: unsafe remote install lock: ${lock}\\n' >&2; return 1; fi;` +
+		` piw_lock_uid=$(stat -c %u ${lock} 2>/dev/null) || {` +
+		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then continue; fi; return 1; };` +
+		` test "$piw_lock_uid" = "$(id -u)" || { printf 'piw: unsafe remote install lock ownership: ${lock}\\n' >&2; return 1; };` +
+		` piw_lock_now=$(date +%s) && piw_lock_mtime=$(stat -c %Y ${lock} 2>/dev/null) || {` +
+		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then continue; fi; return 1; };` +
+		` case "$piw_lock_now:$piw_lock_mtime" in *[!0-9:]*|:*) return 1;; esac;` +
+		` if [ $((piw_lock_now-piw_lock_mtime)) -ge ${REMOTE_INSTALL_LOCK_STALE_SECONDS} ]; then` +
+		` piw_stale_lock=${shareRoot}/.lock-recovery-$$-$piw_lock_attempt;` +
+		` if mv -T ${lock} "$piw_stale_lock" 2>/dev/null; then` +
+		` test -d "$piw_stale_lock" && test ! -L "$piw_stale_lock"` +
+		` && test "$(stat -c %u "$piw_stale_lock")" = "$(id -u)"` +
+		` || { printf 'piw: unsafe stale remote install lock\\n' >&2; return 1; };` +
+		` rm -rf "$piw_stale_lock" || return 1; continue; fi; fi;` +
+		` if [ "$piw_lock_attempt" -ge ${waitSeconds} ]; then` +
+		` printf 'piw: timed out waiting for remote install lock after ${waitSeconds}s\\n' >&2; return 1; fi;` +
+		` piw_lock_attempt=$((piw_lock_attempt+1)); sleep 1 || return 1; done;` +
+		` (while sleep 1; do touch ${lock} 2>/dev/null || exit; done) & piw_lock_heartbeat=$!; };` +
+		` release_install_lock() { piw_release_result=0;` +
+		` if [ -n "$piw_lock_heartbeat" ]; then kill "$piw_lock_heartbeat" 2>/dev/null || true; wait "$piw_lock_heartbeat" 2>/dev/null || true; fi;` +
+		` test -d ${lock} && test ! -L ${lock}` +
+		` && test "$(stat -c %u ${lock})" = "$(id -u)"` +
+		` && test "$(cat ${lock}/owner 2>/dev/null)" = "$$"` +
+		` || { printf 'piw: remote install lock ownership changed while held\\n' >&2; piw_release_result=1; };` +
+		` if [ "$piw_release_result" = 0 ]; then rm -rf ${lock} || piw_release_result=1; fi;` +
+		` return "$piw_release_result"; };`
+	);
+}
+
+function remoteInstallPruneShell(shareRoot: string, releases: string): string {
+	return (
+		`prune_install_scratch() { piw_active_target=;` +
+		` if [ -e ${shareRoot}/current ] || [ -L ${shareRoot}/current ]; then` +
+		` test -L ${shareRoot}/current || return 1; piw_active_target=$(readlink ${shareRoot}/current) || return 1; fi;` +
+		` find ${shareRoot} -mindepth 1 -maxdepth 1 \\( \\( -name .install-\\* ! -name .install-transaction-lock \\)` +
+		` -o -name .candidate-\\* -o -name .current-\\* -o -name .reuse-current-\\* -o -name .rollback-current-\\* \\) -print` +
+		` | while IFS= read -r piw_scratch; do piw_scratch_name=\${piw_scratch##*/};` +
+		` piw_relative_scratch=\${piw_scratch#${shareRoot}/};` +
+		` if [ "$piw_active_target" = "$piw_relative_scratch" ] || [ "$piw_preserve_fallback" = "$piw_scratch" ]; then continue; fi;` +
+		` case "$piw_scratch_name" in .current-*|.reuse-current-*|.rollback-current-*)` +
+		` test -L "$piw_scratch" || return 1;; .candidate-*) test -d "$piw_scratch" && test ! -L "$piw_scratch" || return 1;;` +
+		` .install-*) test ! -L "$piw_scratch" && { test -d "$piw_scratch" || test -f "$piw_scratch"; } || return 1;;` +
+		` *) return 1;; esac; test "$(stat -c %u "$piw_scratch")" = "$(id -u)" || return 1;` +
+		` rm -rf "$piw_scratch" || return 1; done || return 1;` +
+		` find ${releases} -mindepth 1 -maxdepth 1 -name .repair-\\* -print` +
+		` | while IFS= read -r piw_scratch; do piw_relative_scratch=\${piw_scratch#${shareRoot}/};` +
+		` if [ "$piw_active_target" = "$piw_relative_scratch" ] || [ "$piw_preserve_fallback" = "$piw_scratch" ]; then continue; fi;` +
+		` test -d "$piw_scratch" && test ! -L "$piw_scratch"` +
+		` && test "$(stat -c %u "$piw_scratch")" = "$(id -u)" || return 1;` +
+		` rm -rf "$piw_scratch" || return 1; done; };`
+	);
 }
 
 /** Remote command builders. Exported for tests: every interpolated value is path/host validated. */
@@ -267,6 +334,10 @@ export const remoteCommands = {
 		const validated = dirs.map((path) => requireValidRemotePath(path, "state directory"));
 		return (
 			`mkdir -p ${validated.join(" ")} && chmod 700 ${validated.join(" ")}` +
+			(paths.standalone
+				? ` && { command -v stat >/dev/null 2>&1 || { printf 'piw: required remote install tool missing: stat\\n' >&2; exit 1; };` +
+					` stat -c %u ${paths.shareRoot} >/dev/null 2>&1 || { printf 'piw: remote install requires GNU-compatible stat\\n' >&2; exit 1; }; }`
+				: "") +
 			` && for p in ${validated.join(" ")}; do test -d "$p" && test ! -L "$p"` +
 			` && test "$(stat -c %u "$p")" = "$(id -u)" && test "$(stat -c %a "$p")" = 700 || exit 1; done`
 		);
@@ -285,32 +356,19 @@ export const remoteCommands = {
 		const releaseName = basename(paths.revisionDir);
 		if (!new RegExp(`^[0-9a-f]{64}-${artifactSha256}$`, "u").test(releaseName))
 			throw new Error("Invalid release identity");
-		const lock = `${shareRoot}/.install-transaction.lock`;
 		const next = `${shareRoot}/.reuse-current-${releaseName}-$$`;
 		const ownedDirectory = (directory: string) =>
 			`test -d ${directory} && test ! -L ${directory} && test "$(stat -c %u ${directory})" = "$(id -u)"`;
-		const prune =
-			`prune_install_scratch() { active_target=$(readlink ${shareRoot}/current 2>/dev/null || true);` +
-			` for scratch in $(find ${shareRoot} -mindepth 1 -maxdepth 1 -name .candidate-\\* -print;` +
-			` find ${releases} -mindepth 1 -maxdepth 1 -name .repair-\\* -print); do` +
-			` if [ ! -e "$scratch" ] && [ ! -L "$scratch" ]; then continue; fi;` +
-			` relative_scratch=\${scratch#${shareRoot}/};` +
-			` if [ "$active_target" = "$relative_scratch" ]; then continue; fi;` +
-			` test -d "$scratch" && test ! -L "$scratch"` +
-			` && test "$(stat -c %u "$scratch")" = "$(id -u)" || return 1;` +
-			` rm -rf "$scratch" || return 1; done; }`;
 		return (
-			`${ownedDirectory(shareRoot)} && ${ownedDirectory(releases)}` +
-			` && if [ -e ${lock} ] || [ -L ${lock} ]; then` +
-			` test -f ${lock} && test ! -L ${lock};` +
-			` else (umask 077; set -C; : > ${lock}) 2>/dev/null || true; fi` +
-			` && test -f ${lock} && test ! -L ${lock}` +
-			` && test "$(stat -c %u ${lock})" = "$(id -u)" && chmod 600 ${lock}` +
-			` && command -v flock >/dev/null && exec 9>> ${lock} && flock -w 120 9` +
-			` && ${prune}` +
-			` && cleanup_workspace_reuse() { reuse_status=$?; prune_install_scratch || reuse_status=1; rm -f ${next};` +
-			` flock -u 9; exec 9>&-; trap - EXIT HUP INT TERM; exit "$reuse_status"; }` +
-			` && trap cleanup_workspace_reuse EXIT HUP INT TERM && prune_install_scratch` +
+			`${remoteInstallTransactionShell(shareRoot)} ${remoteInstallPruneShell(shareRoot, releases)}` +
+			` piw_lock_heartbeat=; piw_preserve_fallback=;` +
+			` cleanup_workspace_reuse() { piw_reuse_result=$?;` +
+			` prune_install_scratch || printf 'piw: warning: failed to prune remote install scratch after activation\\n' >&2;` +
+			` rm -f ${next}; release_install_lock || { [ "$piw_reuse_result" != 0 ] || piw_reuse_result=1; };` +
+			` trap - EXIT HUP INT TERM; exit "$piw_reuse_result"; };` +
+			` require_install_tools && ${ownedDirectory(shareRoot)} && ${ownedDirectory(releases)}` +
+			` && acquire_install_lock && trap cleanup_workspace_reuse EXIT HUP INT TERM` +
+			` && prune_install_scratch` +
 			` && ${ownedDirectory(releaseDir)} && test -x ${entrypoint} && test -x ${esbuild}` +
 			` && test "$(cat ${marker})" = ${releaseName}` +
 			` && cd ${releaseDir} && test -z "$(find . ! -type d ! -type f -print -quit)"` +
@@ -343,7 +401,6 @@ export const remoteCommands = {
 		const next = `${shareRoot}/.current-${releaseName}-$$`;
 		const rollbackNext = `${shareRoot}/.rollback-current-${releaseName}-$$`;
 		const quarantine = `${quarantineRoot}/${releaseName}-$$`;
-		const lock = `${shareRoot}/.install-transaction.lock`;
 		const ownedDirectory = (directory: string) =>
 			`test -d ${directory} && test ! -L ${directory} && test "$(stat -c %u ${directory})" = "$(id -u)"`;
 		const validateDirectory = (directory: string) =>
@@ -355,32 +412,23 @@ export const remoteCommands = {
 			`rm -f ${link} && cd ${shareRoot} && ln -s releases/${targetName} ${link}` +
 			` && mv -Tf ${link} ${shareRoot}/current`;
 		const restore =
-			`rm -rf ${target} && mv -T ${quarantine} ${target}` +
-			` && if [ "$active" = 1 ]; then ${activate(releaseName, rollbackNext)} && rm -rf ${fallback}; fi`;
-		const prune =
-			`prune_install_scratch() { active_target=$(readlink ${shareRoot}/current 2>/dev/null || true);` +
-			` for scratch in $(find ${shareRoot} -mindepth 1 -maxdepth 1 -name .candidate-\\* -print;` +
-			` find ${releases} -mindepth 1 -maxdepth 1 -name .repair-\\* -print); do` +
-			` if [ ! -e "$scratch" ] && [ ! -L "$scratch" ]; then continue; fi;` +
-			` relative_scratch=\${scratch#${shareRoot}/};` +
-			` if [ "$active_target" = "$relative_scratch" ]; then continue; fi;` +
-			` test -d "$scratch" && test ! -L "$scratch"` +
-			` && test "$(stat -c %u "$scratch")" = "$(id -u)" || return 1;` +
-			` rm -rf "$scratch" || return 1; done; }`;
+			`restore_workspace_release() { rm -rf ${target} && mv -T ${quarantine} ${target}` +
+			` && ${ownedDirectory(target)}` +
+			` && if [ "$piw_repair_active" = 1 ]; then ${activate(releaseName, rollbackNext)}` +
+			` && test "$(readlink ${shareRoot}/current)" = releases/${releaseName}; fi` +
+			` && piw_preserve_fallback= && rm -rf ${fallback}; };`;
 		const cleanup =
-			`cleanup_workspace_install() { install_status=$?; prune_install_scratch || install_status=1;` +
+			`cleanup_workspace_install() { piw_install_result=$?;` +
+			` prune_install_scratch || printf 'piw: warning: failed to prune remote install scratch after activation\\n' >&2;` +
 			` rm -rf ${temporary} ${archive} ${next} ${rollbackNext};` +
-			` flock -u 9; exec 9>&-; trap - EXIT HUP INT TERM; exit "$install_status"; }`;
+			` release_install_lock || { [ "$piw_install_result" != 0 ] || piw_install_result=1; };` +
+			` trap - EXIT HUP INT TERM; exit "$piw_install_result"; };`;
 		return (
-			`${ownedDirectory(shareRoot)} && ${ownedDirectory(releases)} && ${ownedDirectory(quarantineRoot)}` +
-			` && if [ -e ${lock} ] || [ -L ${lock} ]; then` +
-			` test -f ${lock} && test ! -L ${lock};` +
-			` else (umask 077; set -C; : > ${lock}) 2>/dev/null || true; fi` +
-			` && test -f ${lock} && test ! -L ${lock}` +
-			` && test "$(stat -c %u ${lock})" = "$(id -u)" && chmod 600 ${lock}` +
-			` && command -v flock >/dev/null && exec 9>> ${lock} && flock -w 120 9` +
-			` && ${prune} && ${cleanup} && trap cleanup_workspace_install EXIT HUP INT TERM` +
-			` && prune_install_scratch` +
+			`${remoteInstallTransactionShell(shareRoot)} ${remoteInstallPruneShell(shareRoot, releases)}` +
+			` ${restore} ${cleanup} piw_lock_heartbeat=; piw_preserve_fallback=; piw_repair_active=0;` +
+			` require_install_tools && ${ownedDirectory(shareRoot)} && ${ownedDirectory(releases)}` +
+			` && ${ownedDirectory(quarantineRoot)} && acquire_install_lock` +
+			` && trap cleanup_workspace_install EXIT HUP INT TERM && prune_install_scratch` +
 			` && rm -rf ${temporary} ${archive} ${next} ${rollbackNext} && cat > ${archive}` +
 			` && test "$(sha256sum ${archive} | cut -d " " -f 1)" = ${artifactSha256}` +
 			` && mkdir ${temporary} && chmod 700 ${temporary}` +
@@ -393,16 +441,19 @@ export const remoteCommands = {
 			` && if [ -e ${shareRoot}/current ] && [ ! -L ${shareRoot}/current ]; then exit 1; fi` +
 			` && if [ -e ${target} ] || [ -L ${target} ]; then` +
 			` if (${validateDirectory(target)}); then rm -rf ${temporary} && ${activate(releaseName, next)};` +
-			` else cp -a ${temporary} ${candidate} && (${validateDirectory(candidate)}) && active=0` +
+			` else cp -a ${temporary} ${candidate} && (${validateDirectory(candidate)}) && piw_repair_active=0` +
 			` && if test "$(readlink ${shareRoot}/current)" = releases/${releaseName}; then` +
-			` mv -T ${temporary} ${fallback} && ${activate(`.repair-${releaseName}-$$`, next)} && active=1;` +
+			` mv -T ${temporary} ${fallback} && piw_preserve_fallback=${fallback}` +
+			` && ${activate(`.repair-${releaseName}-$$`, next)} && piw_repair_active=1;` +
 			` else rm -rf ${temporary}; fi` +
 			` && if ! mv -T ${target} ${quarantine}; then` +
-			` if [ "$active" = 1 ]; then ${activate(releaseName, rollbackNext)} && rm -rf ${fallback}; fi; exit 1; fi` +
+			` if [ "$piw_repair_active" = 1 ] && ${activate(releaseName, rollbackNext)}` +
+			` && test "$(readlink ${shareRoot}/current)" = releases/${releaseName}; then` +
+			` piw_preserve_fallback=; rm -rf ${fallback}; fi; exit 1; fi` +
 			` && if ! mv -T ${candidate} ${target} || ! (${validateDirectory(target)}); then` +
-			` ${restore}; exit 1; fi` +
-			` && if ! (${activate(releaseName, next)}); then ${restore}; exit 1; fi` +
-			` && rm -rf ${fallback}; fi;` +
+			` restore_workspace_release; exit 1; fi` +
+			` && if ! (${activate(releaseName, next)}); then restore_workspace_release; exit 1; fi` +
+			` && piw_preserve_fallback= && rm -rf ${fallback}; fi;` +
 			` else mv -T ${temporary} ${target} && (${validateDirectory(target)})` +
 			` && ${activate(releaseName, next)}; fi` +
 			` && test -x ${entrypoint} && test -x ${esbuild}`

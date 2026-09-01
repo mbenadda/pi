@@ -1,14 +1,33 @@
-import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import {
+	chmod,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	readlink,
+	rm,
+	stat,
+	symlink,
+	utimes,
+	writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { buildSshSpawnArgs } from "@earendil-works/pi-client/ssh";
 import { describe, expect, test } from "vitest";
 import { cli } from "../src/cli/experimental/cli.ts";
 import {
 	buildInstalledWorkspaceRemotePaths,
 	buildWorkspaceRemotePaths,
+	REMOTE_INSTALL_LOCK_WAIT_MS,
 	readWorkspaceLocalState,
 	remoteCommands,
 	requireValidRemotePath,
+	SSH_EXEC_TIMEOUT_MS,
 	serverSocketPath,
 	waitForWorkspaceGeneration,
 	workspaceSshRemoteCommand,
@@ -20,6 +39,76 @@ const REVISION = "0123456789abcdef0123456789abcdef01234567";
 const SERVER_ID = "00000000-0000-4000-8000-000000000001";
 const GENERATION = `${REVISION}:00000000-0000-4000-8000-000000000003`;
 const REMOTE_CWD = "/home/bits/go/src/github.com/DataDog/dd-source";
+
+function remoteInstallArchive(): Buffer {
+	const files = [
+		{ path: ".pi-workspace-artifact.json", data: "{}", mode: 0o600 },
+		{ path: "bin/pi-workspace-server", data: "server", mode: 0o700 },
+		{ path: "bin/esbuild", data: "esbuild", mode: 0o700 },
+	];
+	const blocks: Buffer[] = [];
+	for (const file of files) {
+		const data = Buffer.from(file.data);
+		const header = Buffer.alloc(512);
+		header.write(file.path, 0, 100, "utf8");
+		for (const [offset, length, value] of [
+			[100, 8, file.mode],
+			[108, 8, 0],
+			[116, 8, 0],
+			[124, 12, data.length],
+			[136, 12, 0],
+		] as const) {
+			header.write(value.toString(8).padStart(length - 1, "0"), offset, length - 1, "ascii");
+			header[offset + length - 1] = 0;
+		}
+		header.fill(32, 148, 156);
+		header[156] = "0".charCodeAt(0);
+		header.write("ustar", 257, 6, "ascii");
+		header.write("00", 263, 2, "ascii");
+		let checksum = 0;
+		for (const byte of header) checksum += byte;
+		header.write(checksum.toString(8).padStart(6, "0"), 148, 6, "ascii");
+		header[154] = 0;
+		header[155] = 32;
+		blocks.push(header, data);
+		const padding = (512 - (data.length % 512)) % 512;
+		if (padding > 0) blocks.push(Buffer.alloc(padding));
+	}
+	blocks.push(Buffer.alloc(1024));
+	return gzipSync(Buffer.concat(blocks));
+}
+
+function shellTestPath(): string {
+	return process.platform === "darwin"
+		? [
+				"/opt/homebrew/opt/coreutils/libexec/gnubin",
+				"/opt/homebrew/opt/findutils/libexec/gnubin",
+				"/opt/homebrew/opt/gnu-tar/libexec/gnubin",
+				process.env.PATH ?? "",
+			].join(":")
+		: (process.env.PATH ?? "");
+}
+
+function runGeneratedShell(
+	shell: string,
+	command: string,
+	input?: Uint8Array,
+): Promise<{ code: number; stderr: string }> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(shell, shell.endsWith("zsh") ? ["-f", "-c", command] : ["-c", command], {
+			env: { ...process.env, PATH: shellTestPath() },
+			stdio: ["pipe", "ignore", "pipe"],
+		});
+		let stderr = "";
+		child.stderr.setEncoding("utf8");
+		child.stderr.on("data", (chunk: string) => {
+			stderr += chunk;
+		});
+		child.once("error", reject);
+		child.once("exit", (code) => resolve({ code: code ?? 0, stderr }));
+		child.stdin.end(input);
+	});
+}
 
 function paths() {
 	return buildWorkspaceRemotePaths(HOME, REVISION);
@@ -300,9 +389,10 @@ describe("workspace remote paths and command construction", () => {
 		const installed = buildInstalledWorkspaceRemotePaths(HOME, REVISION, manifestDigest, artifactDigest);
 		const command = remoteCommands.installArtifact(installed, artifactDigest);
 		const reuse = remoteCommands.isInstalled(installed, artifactDigest);
-		const reuseLocked = reuse.indexOf("flock -w 120 9");
+		const reuseLocked = reuse.indexOf("acquire_install_lock");
 		const reuseModeVerified = reuse.indexOf(`test -x ${installed.cliEntry}`);
 		const reuseActivated = reuse.indexOf(`ln -s releases/${manifestDigest}-${artifactDigest}`);
+		expect(reuse).not.toContain("flock");
 		expect(reuseLocked).toBeGreaterThan(-1);
 		expect(reuseModeVerified).toBeGreaterThan(reuseLocked);
 		expect(reuseActivated).toBeGreaterThan(reuseModeVerified);
@@ -317,14 +407,17 @@ describe("workspace remote paths and command construction", () => {
 		expect(command).toContain(".pi-workspace-artifact.json");
 		expect(command).toContain("sha256sum > .tree.sha256");
 		expect(command).toContain(`[ ! -L ${installed.shareRoot}/current ]`);
-		const lockAcquired = command.indexOf(`flock -w 120 9`);
+		const lockAcquired = command.lastIndexOf(`acquire_install_lock`);
 		const archiveReceived = command.indexOf(`cat > ${installed.shareRoot}/.install-`);
+		expect(command).not.toContain("flock");
 		expect(lockAcquired).toBeGreaterThan(-1);
 		expect(archiveReceived).toBeGreaterThan(lockAcquired);
 		expect(command).toContain("trap cleanup_workspace_install EXIT HUP INT TERM");
-		expect(command).toContain(`test -f ${installed.shareRoot}/.install-transaction.lock`);
-		expect(command).toContain(`stat -c %u ${installed.shareRoot}/.install-transaction.lock`);
-		expect(command).toContain(`find ${installed.shareRoot} -mindepth 1 -maxdepth 1 -name .candidate-\\*`);
+		expect(command).toContain(`mkdir ${installed.shareRoot}/.install-transaction-lock`);
+		expect(command).toContain(`stat -c %u ${installed.shareRoot}/.install-transaction-lock`);
+		expect(command).toContain("required remote install tool missing");
+		expect(command).toContain(`-name .install-\\* ! -name .install-transaction-lock`);
+		expect(command).toContain(`-name .candidate-\\*`);
 		expect(command).toContain(`find ${installed.shareRoot}/releases -mindepth 1 -maxdepth 1 -name .repair-\\*`);
 		const candidate = `${installed.shareRoot}/.candidate-${manifestDigest}-${artifactDigest}-$$`;
 		const fallback = `${installed.shareRoot}/releases/.repair-${manifestDigest}-${artifactDigest}-$$`;
@@ -340,12 +433,124 @@ describe("workspace remote paths and command construction", () => {
 		expect(quarantined).toBeGreaterThan(fallbackActivated);
 		expect(replacementActivated).toBeGreaterThan(quarantined);
 		expect(command).toContain(`rm -rf ${installed.revisionDir} && mv -T ${quarantine} ${installed.revisionDir}`);
-		expect(command).toContain(`rm -rf ${fallback}`);
+		expect(command).toContain(`piw_preserve_fallback=${fallback}`);
+		expect(command).toContain(`piw_preserve_fallback= && rm -rf ${fallback}`);
 		const targetModeVerified = command.indexOf(`test -x ${installed.revisionDir}/bin/pi-workspace-server`);
-		const targetActivated = command.indexOf(`ln -s releases/${manifestDigest}-${artifactDigest}`);
+		const targetActivated = command.lastIndexOf(`ln -s releases/${manifestDigest}-${artifactDigest}`);
 		expect(targetModeVerified).toBeGreaterThan(-1);
 		expect(targetActivated).toBeGreaterThan(targetModeVerified);
 	});
+
+	test("keeps the remote lock wait below the SSH execution timeout", () => {
+		expect(REMOTE_INSTALL_LOCK_WAIT_MS).toBeLessThan(SSH_EXEC_TIMEOUT_MS);
+	});
+
+	test("executes remote install, reuse, stale recovery, and concurrency under sh and zsh", async () => {
+		const shells = ["/bin/sh", "/bin/zsh"].filter(existsSync);
+		expect(shells).toContain("/bin/sh");
+		const archive = remoteInstallArchive();
+		const artifactDigest = createHash("sha256").update(archive).digest("hex");
+		const manifestDigest = "b".repeat(64);
+		for (const shell of shells) {
+			const home = await mkdtemp(join(tmpdir(), "pi-workspace-shell-"));
+			try {
+				const installed = buildInstalledWorkspaceRemotePaths(home, REVISION, manifestDigest, artifactDigest);
+				await Promise.all([
+					mkdir(join(installed.shareRoot, "releases"), { recursive: true, mode: 0o700 }),
+					mkdir(join(installed.shareRoot, "quarantine"), { recursive: true, mode: 0o700 }),
+				]);
+				await chmod(installed.shareRoot, 0o700);
+				const install = remoteCommands.installArtifact(installed, artifactDigest);
+				const installs =
+					shell === "/bin/sh"
+						? await Promise.all([
+								runGeneratedShell(shell, install, archive),
+								runGeneratedShell(shell, install, archive),
+							])
+						: [await runGeneratedShell(shell, install, archive)];
+				expect(
+					installs.every((result) => result.code === 0),
+					`${shell}: ${installs.map((result) => result.stderr).join("\n")}`,
+				).toBe(true);
+				expect(await readlink(join(installed.shareRoot, "current"))).toBe(
+					`releases/${manifestDigest}-${artifactDigest}`,
+				);
+				expect(await readFile(installed.cliEntry, "utf8")).toBe("server");
+
+				await mkdir(join(installed.shareRoot, ".install-stale"));
+				await writeFile(join(installed.shareRoot, ".install-stale.tar.gz"), "partial", "utf8");
+				await symlink("releases/missing", join(installed.shareRoot, ".current-stale"));
+				await mkdir(join(installed.shareRoot, "releases", ".repair-stale"));
+				const reuse = remoteCommands.isInstalled(installed, artifactDigest);
+				const reused =
+					shell === "/bin/sh"
+						? await Promise.all([runGeneratedShell(shell, reuse), runGeneratedShell(shell, reuse)])
+						: [await runGeneratedShell(shell, reuse)];
+				expect(
+					reused.every((result) => result.code === 0),
+					`${shell}: ${reused.map((result) => result.stderr).join("\n")}`,
+				).toBe(true);
+				const scratch = await readdir(installed.shareRoot);
+				expect(scratch.some((name) => name.startsWith(".install-") && name !== ".install-transaction-lock")).toBe(
+					false,
+				);
+				expect(scratch.some((name) => name.startsWith(".current-"))).toBe(false);
+				expect(
+					(await readdir(join(installed.shareRoot, "releases"))).some((name) => name.startsWith(".repair-")),
+				).toBe(false);
+
+				if (shell === "/bin/sh") {
+					const unsafeScratch = join(installed.shareRoot, ".candidate-unsafe");
+					await symlink("missing", unsafeScratch);
+					const unsafeScratchResult = await runGeneratedShell(shell, reuse);
+					expect(unsafeScratchResult.code).not.toBe(0);
+					expect(unsafeScratchResult.stderr).toContain("failed to prune remote install scratch after activation");
+					await rm(unsafeScratch);
+
+					const lock = join(installed.shareRoot, ".install-transaction-lock");
+					await symlink("missing", lock);
+					const unsafeLockResult = await runGeneratedShell(shell, reuse);
+					expect(unsafeLockResult.code).not.toBe(0);
+					expect(unsafeLockResult.stderr).toContain("unsafe remote install lock");
+					await rm(lock);
+					await mkdir(lock, { mode: 0o700 });
+					await writeFile(join(lock, "owner"), "999999999", "utf8");
+					await utimes(lock, new Date(0), new Date(0));
+					expect(await runGeneratedShell(shell, reuse)).toMatchObject({ code: 0 });
+
+					await writeFile(installed.cliEntry, "corrupt", "utf8");
+					const faultBin = join(home, "fault-bin");
+					await mkdir(faultBin, { mode: 0o700 });
+					const realMv = spawnSync("sh", ["-c", "command -v mv"], {
+						env: { ...process.env, PATH: shellTestPath() },
+						encoding: "utf8",
+					}).stdout.trim();
+					const faultMv = join(faultBin, "mv");
+					await writeFile(
+						faultMv,
+						`#!/bin/sh\ncase "$2" in *.candidate-*|*/quarantine/*) exit 91;; esac\nexec ${realMv} "$@"\n`,
+						{ mode: 0o700 },
+					);
+					const failedRepair = await runGeneratedShell(
+						shell,
+						`PATH=${faultBin}:${shellTestPath()}; export PATH; ${install}`,
+						archive,
+					);
+					expect(failedRepair.code).not.toBe(0);
+					expect(await readlink(join(installed.shareRoot, "current"))).toMatch(/^releases\/\.repair-/u);
+					expect(await readFile(join(installed.shareRoot, "current", "bin", "pi-workspace-server"), "utf8")).toBe(
+						"server",
+					);
+					expect(
+						(await readdir(join(installed.shareRoot, "releases"))).some((name) => name.startsWith(".repair-")),
+					).toBe(true);
+					expect(await runGeneratedShell(shell, install, archive)).toMatchObject({ code: 0 });
+				}
+			} finally {
+				await rm(home, { recursive: true, force: true });
+			}
+		}
+	}, 60_000);
 
 	test("builds stop and purge commands that only touch MVP-owned paths", () => {
 		const built = paths();

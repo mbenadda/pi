@@ -1,4 +1,16 @@
-import { chmod, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, utimes, writeFile } from "node:fs/promises";
+import {
+	chmod,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	readlink,
+	rm,
+	stat,
+	symlink,
+	utimes,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -300,6 +312,7 @@ describe("Workspace release installation", () => {
 					platform: "darwin-arm64",
 					onRepairQuarantined: async () => {
 						injected = true;
+						expect((await stat(join(root, ".install-transaction-lock"))).isDirectory()).toBe(true);
 						expect(await readlink(join(root, "current"))).toMatch(/^releases\/\.repair-/u);
 						expect(await readFile(join(root, "current", "bin", "piw"), "utf8")).toBe("replacement");
 						throw new Error("injected repair failure");
@@ -311,6 +324,113 @@ describe("Workspace release installation", () => {
 			expect(await readFile(join(root, "current", "bin", "piw"), "utf8")).toBe("corrupt");
 			expect((await readdir(root)).some((name) => name.startsWith(".candidate-"))).toBe(false);
 			expect((await readdir(join(root, "releases"))).some((name) => name.startsWith(".repair-"))).toBe(false);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("retains the active repair fallback when rollback itself fails", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-workspace-install-"));
+		try {
+			const archive = createTarGzip([
+				{ path: ".pi-workspace-artifact.json", data: IDENTITY },
+				{ path: "bin/piw", data: "replacement", mode: 0o755 },
+			]);
+			const fixture = release(archive);
+			const installed = await installWorkspaceArtifact({
+				root,
+				archive,
+				rawManifest: fixture.raw,
+				expectedManifestSha256: fixture.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
+			});
+			await writeFile(installed.entrypoint, "corrupt", "utf8");
+			let failure: unknown;
+			try {
+				await installWorkspaceArtifact({
+					root,
+					archive,
+					rawManifest: fixture.raw,
+					expectedManifestSha256: fixture.manifestSha256,
+					role: "client",
+					platform: "darwin-arm64",
+					onRepairQuarantined: async () => {
+						throw new Error("injected replacement failure");
+					},
+					onRepairRollback: async () => {
+						throw new Error("injected rollback failure");
+					},
+				});
+			} catch (error) {
+				failure = error;
+			}
+			if (!(failure instanceof AggregateError)) throw new Error("Expected repair and rollback failures");
+			expect(failure.errors).toEqual([
+				expect.objectContaining({ message: "injected replacement failure" }),
+				expect.objectContaining({ message: "injected rollback failure" }),
+			]);
+			expect(await readlink(join(root, "current"))).toMatch(/^releases\/\.repair-/u);
+			expect(await readFile(join(root, "current", "bin", "piw"), "utf8")).toBe("replacement");
+			expect((await readdir(join(root, "releases"))).some((name) => name.startsWith(".repair-"))).toBe(true);
+
+			const recovered = await installWorkspaceArtifact({
+				root,
+				archive,
+				rawManifest: fixture.raw,
+				expectedManifestSha256: fixture.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
+			});
+			expect(await readlink(join(root, "current"))).toBe(
+				`releases/${fixture.manifestSha256}-${fixture.artifact.sha256}`,
+			);
+			expect(await readFile(recovered.entrypoint, "utf8")).toBe("replacement");
+			expect((await readdir(join(root, "releases"))).some((name) => name.startsWith(".repair-"))).toBe(false);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("aggregates a primary repair failure with local scratch pruning failure", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-workspace-install-"));
+		try {
+			const archive = createTarGzip([
+				{ path: ".pi-workspace-artifact.json", data: IDENTITY },
+				{ path: "bin/piw", data: "replacement", mode: 0o755 },
+			]);
+			const fixture = release(archive);
+			const installed = await installWorkspaceArtifact({
+				root,
+				archive,
+				rawManifest: fixture.raw,
+				expectedManifestSha256: fixture.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
+			});
+			await writeFile(installed.entrypoint, "corrupt", "utf8");
+			let failure: unknown;
+			try {
+				await installWorkspaceArtifact({
+					root,
+					archive,
+					rawManifest: fixture.raw,
+					expectedManifestSha256: fixture.manifestSha256,
+					role: "client",
+					platform: "darwin-arm64",
+					onRepairQuarantined: async () => {
+						await symlink("missing", join(root, ".install-unsafe"));
+						throw new Error("primary repair failure");
+					},
+				});
+			} catch (error) {
+				failure = error;
+			}
+			if (!(failure instanceof AggregateError)) throw new Error("Expected transaction and cleanup failures");
+			expect(failure.errors.map((error) => (error instanceof Error ? error.message : String(error)))).toEqual([
+				"primary repair failure",
+				expect.stringContaining("scratch path is unsafe"),
+			]);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -451,6 +571,9 @@ describe("Workspace release installation", () => {
 			expect((await stat(modeRepaired.entrypoint)).mode & 0o777).toBe(0o700);
 
 			await mkdir(join(root, ".candidate-stale"));
+			await mkdir(join(root, ".install-stale"));
+			await writeFile(join(root, ".install-stale.tar.gz"), "partial", "utf8");
+			await symlink("releases/missing", join(root, ".current-stale"));
 			await mkdir(join(root, "releases", ".repair-stale"));
 			await writeFile(updated.entrypoint, "tampered", "utf8");
 			const repaired = await installWorkspaceArtifact({
@@ -464,7 +587,12 @@ describe("Workspace release installation", () => {
 			expect(repaired.reused).toBe(false);
 			expect(await readFile(repaired.entrypoint, "utf8")).toBe("second");
 			expect((await readdir(join(root, "quarantine"))).length).toBe(2);
-			expect((await readdir(root)).some((name) => name.startsWith(".candidate-"))).toBe(false);
+			const rootEntries = await readdir(root);
+			expect(rootEntries.some((name) => name.startsWith(".candidate-"))).toBe(false);
+			expect(rootEntries.some((name) => name.startsWith(".install-") && name !== ".install-transaction-lock")).toBe(
+				false,
+			);
+			expect(rootEntries.some((name) => name.startsWith(".current-"))).toBe(false);
 			expect((await readdir(join(root, "releases"))).some((name) => name.startsWith(".repair-"))).toBe(false);
 		} finally {
 			await rm(root, { recursive: true, force: true });
