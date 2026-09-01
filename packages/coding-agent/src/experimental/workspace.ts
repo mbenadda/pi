@@ -291,7 +291,8 @@ export const remoteCommands = {
 			`test -d ${directory} && test ! -L ${directory} && test "$(stat -c %u ${directory})" = "$(id -u)"`;
 		const prune =
 			`prune_install_scratch() { active_target=$(readlink ${shareRoot}/current 2>/dev/null || true);` +
-			` for scratch in ${shareRoot}/.candidate-* ${releases}/.repair-*; do` +
+			` for scratch in $(find ${shareRoot} -mindepth 1 -maxdepth 1 -name .candidate-\\* -print;` +
+			` find ${releases} -mindepth 1 -maxdepth 1 -name .repair-\\* -print); do` +
 			` if [ ! -e "$scratch" ] && [ ! -L "$scratch" ]; then continue; fi;` +
 			` relative_scratch=\${scratch#${shareRoot}/};` +
 			` if [ "$active_target" = "$relative_scratch" ]; then continue; fi;` +
@@ -358,7 +359,8 @@ export const remoteCommands = {
 			` && if [ "$active" = 1 ]; then ${activate(releaseName, rollbackNext)} && rm -rf ${fallback}; fi`;
 		const prune =
 			`prune_install_scratch() { active_target=$(readlink ${shareRoot}/current 2>/dev/null || true);` +
-			` for scratch in ${shareRoot}/.candidate-* ${releases}/.repair-*; do` +
+			` for scratch in $(find ${shareRoot} -mindepth 1 -maxdepth 1 -name .candidate-\\* -print;` +
+			` find ${releases} -mindepth 1 -maxdepth 1 -name .repair-\\* -print); do` +
 			` if [ ! -e "$scratch" ] && [ ! -L "$scratch" ]; then continue; fi;` +
 			` relative_scratch=\${scratch#${shareRoot}/};` +
 			` if [ "$active_target" = "$relative_scratch" ]; then continue; fi;` +

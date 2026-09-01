@@ -322,8 +322,8 @@ describe("workspace remote paths and command construction", () => {
 		expect(command).toContain("trap cleanup_workspace_install EXIT HUP INT TERM");
 		expect(command).toContain(`test -f ${installed.shareRoot}/.install-transaction.lock`);
 		expect(command).toContain(`stat -c %u ${installed.shareRoot}/.install-transaction.lock`);
-		expect(command).toContain(`for scratch in ${installed.shareRoot}/.candidate-*`);
-		expect(command).toContain(`${installed.shareRoot}/releases/.repair-*`);
+		expect(command).toContain(`find ${installed.shareRoot} -mindepth 1 -maxdepth 1 -name .candidate-\\*`);
+		expect(command).toContain(`find ${installed.shareRoot}/releases -mindepth 1 -maxdepth 1 -name .repair-\\*`);
 		const candidate = `${installed.shareRoot}/.candidate-${manifestDigest}-${artifactDigest}-$$`;
 		const fallback = `${installed.shareRoot}/releases/.repair-${manifestDigest}-${artifactDigest}-$$`;
 		const quarantine = `${installed.shareRoot}/quarantine/${manifestDigest}-${artifactDigest}-$$`;
