@@ -50,6 +50,28 @@ const SERVER_ID = "00000000-0000-4000-8000-000000000001";
 const GENERATION = `${REVISION}:00000000-0000-4000-8000-000000000003`;
 const REMOTE_CWD = "/home/bits/go/src/github.com/DataDog/dd-source";
 
+function remoteInstallBundle(archive: Buffer) {
+	const artifact = {
+		role: "server" as const,
+		platform: "linux-x64",
+		file: "server.tar.gz",
+		sha256: createHash("sha256").update(archive).digest("hex"),
+		size: archive.length,
+		entrypoint: "bin/pi-workspace-server",
+	};
+	return {
+		manifest: {
+			schemaVersion: 1 as const,
+			revision: REVISION,
+			protocolVersion: 1,
+			artifacts: [artifact],
+		},
+		manifestSha256: "b".repeat(64),
+		artifact,
+		archive,
+	};
+}
+
 function remoteInstallArchive(): Buffer {
 	const files = [
 		{ path: ".pi-workspace-artifact.json", data: "{}", mode: 0o600 },
@@ -518,12 +540,16 @@ describe("workspace remote paths and command construction", () => {
 		expect(REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS).toBeLessThan(REMOTE_INSTALL_LOCK_HARD_STALE_MS);
 	});
 
-	test("treats a signal-only generated shell exit as a failure", async () => {
-		await expect(runGeneratedShell("/bin/sh", "kill -TERM $$")).resolves.toMatchObject({
-			code: 1,
-			signal: "SIGTERM",
+	if (process.platform === "linux") {
+		test("treats a signal-only generated shell exit as a failure", async () => {
+			await expect(runGeneratedShell("/bin/sh", "kill -TERM $$")).resolves.toMatchObject({
+				code: 1,
+				signal: "SIGTERM",
+			});
 		});
-	});
+	} else {
+		test.skip(`treats a signal-only generated shell exit as a failure; unsupported on ${process.platform}`);
+	}
 
 	test("treats a signal-only SSH exit as a production failure", async () => {
 		const fakeBin = await mkdtemp(join(tmpdir(), "pi-workspace-ssh-signal-"));
@@ -557,41 +583,56 @@ describe("workspace remote paths and command construction", () => {
 		}
 	});
 
-	test("rejects a direct install cleanly when SSH closes archive stdin", async () => {
+	test("prefers a remote install failure over archive stdin EPIPE", async () => {
 		const fakeBin = await mkdtemp(join(tmpdir(), "pi-workspace-ssh-stdin-"));
 		const counter = join(fakeBin, "counter");
 		const originalPath = process.env.PATH;
 		try {
 			await writeFile(
 				join(fakeBin, "ssh"),
-				`#!/bin/sh\ncount=$(cat ${counter} 2>/dev/null || printf 0)\ncount=$((count+1))\nprintf %s "$count" > ${counter}\nif [ "$count" = 1 ]; then exit 1; fi\nexec 0<&-\nsleep 1\nexit 17\n`,
+				`#!/bin/sh\ncount=$(cat ${counter} 2>/dev/null || printf 0)\ncount=$((count+1))\nprintf %s "$count" > ${counter}\nif [ "$count" = 1 ]; then exit 1; fi\nexec 0<&-\nprintf 'remote install diagnostic\\n' >&2\nsleep 1\nexit 17\n`,
 				{ mode: 0o700 },
 			);
 			process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
-			const archive = Buffer.alloc(32 * 1024 * 1024);
-			const artifact = {
-				role: "server" as const,
-				platform: "linux-x64",
-				file: "server.tar.gz",
-				sha256: createHash("sha256").update(archive).digest("hex"),
-				size: archive.length,
-				entrypoint: "bin/pi-workspace-server",
-			};
-			const bundle = {
-				manifest: {
-					schemaVersion: 1 as const,
-					revision: REVISION,
-					protocolVersion: 1,
-					artifacts: [artifact],
-				},
-				manifestSha256: "b".repeat(64),
-				artifact,
-				archive,
-			};
-			const installed = buildInstalledWorkspaceRemotePaths(HOME, REVISION, bundle.manifestSha256, artifact.sha256);
-			await expect(installRemoteWorkspaceArtifact("workspace-bcli-10", installed, bundle)).rejects.toThrow(
-				/Remote Workspace backend install rejected archive input.*EPIPE/,
+			const bundle = remoteInstallBundle(Buffer.alloc(32 * 1024 * 1024));
+			const installed = buildInstalledWorkspaceRemotePaths(
+				HOME,
+				REVISION,
+				bundle.manifestSha256,
+				bundle.artifact.sha256,
 			);
+			await expect(installRemoteWorkspaceArtifact("workspace-bcli-10", installed, bundle)).rejects.toMatchObject({
+				message: "Remote Workspace backend install failed (exit 17): remote install diagnostic",
+				cause: { code: "EPIPE" },
+			});
+		} finally {
+			process.env.PATH = originalPath;
+			await rm(fakeBin, { recursive: true, force: true });
+		}
+	});
+
+	test("reports archive stdin EPIPE when the remote has no failure verdict", async () => {
+		const fakeBin = await mkdtemp(join(tmpdir(), "pi-workspace-ssh-input-only-"));
+		const counter = join(fakeBin, "counter");
+		const originalPath = process.env.PATH;
+		try {
+			await writeFile(
+				join(fakeBin, "ssh"),
+				`#!/bin/sh\ncount=$(cat ${counter} 2>/dev/null || printf 0)\ncount=$((count+1))\nprintf %s "$count" > ${counter}\nif [ "$count" = 1 ]; then exit 1; fi\nexec 0<&-\nsleep 1\nexit 0\n`,
+				{ mode: 0o700 },
+			);
+			process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
+			const bundle = remoteInstallBundle(Buffer.alloc(32 * 1024 * 1024));
+			const installed = buildInstalledWorkspaceRemotePaths(
+				HOME,
+				REVISION,
+				bundle.manifestSha256,
+				bundle.artifact.sha256,
+			);
+			await expect(installRemoteWorkspaceArtifact("workspace-bcli-10", installed, bundle)).rejects.toMatchObject({
+				message: expect.stringMatching(/Remote Workspace backend install rejected archive input.*EPIPE/u),
+				cause: { code: "EPIPE" },
+			});
 		} finally {
 			process.env.PATH = originalPath;
 			await rm(fakeBin, { recursive: true, force: true });
@@ -858,6 +899,64 @@ describe("workspace exact generation readiness", () => {
 			}),
 		).rejects.toThrow(/exact Workspace server generation/);
 		expect(probes).toBe(0);
+	});
+
+	test("caps every nested readiness operation at the remaining wall-clock budget", async () => {
+		let clock = 0;
+		const timeouts: number[] = [];
+		await expect(
+			waitForWorkspaceGeneration(GENERATION, 1_000, {
+				readServerId: async (timeoutMs) => {
+					timeouts.push(timeoutMs);
+					clock += 100;
+					return SERVER_ID;
+				},
+				readGeneration: async (timeoutMs) => {
+					timeouts.push(timeoutMs);
+					clock += 200;
+					return GENERATION;
+				},
+				hasSocket: async (_serverId, timeoutMs) => {
+					timeouts.push(timeoutMs);
+					clock += 300;
+					return true;
+				},
+				probe: async (_serverId, timeoutMs) => {
+					timeouts.push(timeoutMs);
+					clock += timeoutMs;
+					throw new SshCommandTimeoutError("workspace-bcli-10", timeoutMs);
+				},
+				now: () => clock,
+				sleep: async (delayMs) => {
+					clock += delayMs;
+				},
+			}),
+		).rejects.toThrow(/exact Workspace server generation/);
+		expect(timeouts).toEqual([1_000, 900, 700, 400]);
+		expect(clock).toBe(1_000);
+	});
+
+	test("does not start a socket check after the stop wall-clock deadline", async () => {
+		let clock = 0;
+		const timeouts: number[] = [];
+		let checks = 0;
+		await expect(
+			waitForWorkspaceSocketRemoval(1_000, {
+				hasSocket: async (timeoutMs) => {
+					checks += 1;
+					timeouts.push(timeoutMs);
+					clock += 700;
+					return true;
+				},
+				now: () => clock,
+				sleep: async (delayMs) => {
+					clock += delayMs;
+				},
+			}),
+		).resolves.toBe(false);
+		expect(timeouts).toEqual([1_000]);
+		expect(checks).toBe(1);
+		expect(clock).toBe(1_000);
 	});
 
 	test("tolerates only typed SSH interruptions while readiness polling remains within its deadline", async () => {

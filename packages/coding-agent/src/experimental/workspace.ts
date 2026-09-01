@@ -819,16 +819,19 @@ export async function installRemoteWorkspaceArtifact(
 	if (timedOut) {
 		throw new SshCommandTimeoutError(host, REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS, "Remote Workspace backend install");
 	}
-	if (stdinError !== undefined) {
-		throw new Error(`Remote Workspace backend install rejected archive input: ${stdinError.message}`, {
-			cause: stdinError,
-		});
-	}
 	if (outcome.code === null) {
 		throw new SshCommandSignalError(host, outcome.signal, "Remote Workspace backend install");
 	}
 	if (outcome.code !== 0) {
-		throw new Error(`Remote Workspace backend install failed (exit ${outcome.code}): ${stderr.trim()}`);
+		throw new Error(
+			`Remote Workspace backend install failed (exit ${outcome.code}): ${stderr.trim()}`,
+			stdinError === undefined ? undefined : { cause: stdinError },
+		);
+	}
+	if (stdinError !== undefined) {
+		throw new Error(`Remote Workspace backend install rejected archive input: ${stdinError.message}`, {
+			cause: stdinError,
+		});
 	}
 	const verified = await sshExec(host, remoteCommands.isInstalled(paths, bundle.artifact.sha256), {
 		timeoutMs: REMOTE_INSTALL_CHECK_TIMEOUT_MS,
@@ -859,6 +862,7 @@ export async function probeRemoteServer(
 		readonly remoteCommand: readonly string[];
 	},
 	host: string,
+	timeoutMs = SSH_EXEC_TIMEOUT_MS,
 ): Promise<boolean> {
 	const client = new Client({
 		serverId: requireValidServerId(connection.serverId),
@@ -867,12 +871,23 @@ export async function probeRemoteServer(
 			remoteCommand: connection.remoteCommand,
 		}),
 	});
+	let timer: NodeJS.Timeout | undefined;
 	try {
-		await client.connect();
+		await Promise.race([
+			client.connect(),
+			new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(
+					() => reject(new SshCommandTimeoutError(host, timeoutMs, "Workspace server probe")),
+					timeoutMs,
+				);
+				timer.unref();
+			}),
+		]);
 		return true;
 	} catch {
 		return false;
 	} finally {
+		if (timer !== undefined) clearTimeout(timer);
 		await client.dispose().catch(() => {});
 	}
 }
@@ -946,16 +961,24 @@ export async function writeWorkspaceLocalState(
 }
 
 /** Reads the logical remote server identity if the MVP has created one before. */
-async function readRemoteServerId(host: string, paths: WorkspaceRemotePaths): Promise<string | undefined> {
-	const identity = await sshExec(host, remoteCommands.readServerId(paths));
+async function readRemoteServerId(
+	host: string,
+	paths: WorkspaceRemotePaths,
+	timeoutMs = SSH_EXEC_TIMEOUT_MS,
+): Promise<string | undefined> {
+	const identity = await sshExec(host, remoteCommands.readServerId(paths), { timeoutMs });
 	if (identity.code !== 0) return undefined;
 	const serverId = identity.stdout.trim();
 	if (serverId.length === 0) return undefined;
 	return requireValidServerId(serverId);
 }
 
-async function readRemoteServerGeneration(host: string, paths: WorkspaceRemotePaths): Promise<string | undefined> {
-	const result = await sshExec(host, remoteCommands.readServerRevision(paths));
+async function readRemoteServerGeneration(
+	host: string,
+	paths: WorkspaceRemotePaths,
+	timeoutMs = SSH_EXEC_TIMEOUT_MS,
+): Promise<string | undefined> {
+	const result = await sshExec(host, remoteCommands.readServerRevision(paths), { timeoutMs });
 	if (result.code !== 0) return undefined;
 	const generation = result.stdout.trim();
 	return new RegExp(`^${paths.revision}:[0-9a-f-]{36}$`, "u").test(generation) ? generation : undefined;
@@ -988,10 +1011,10 @@ async function startRemoteServer(
 }
 
 export interface WorkspaceGenerationOperations {
-	readServerId(): Promise<string | undefined>;
-	readGeneration(): Promise<string | undefined>;
-	hasSocket(serverId: string): Promise<boolean>;
-	probe(serverId: string): Promise<boolean>;
+	readServerId(timeoutMs: number): Promise<string | undefined>;
+	readGeneration(timeoutMs: number): Promise<string | undefined>;
+	hasSocket(serverId: string, timeoutMs: number): Promise<boolean>;
+	probe(serverId: string, timeoutMs: number): Promise<boolean>;
 	now?(): number;
 	sleep?(delayMs: number): Promise<void>;
 }
@@ -1006,28 +1029,34 @@ export async function waitForWorkspaceGeneration(
 	const sleep =
 		operations.sleep ?? ((delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
 	const deadline = now() + timeoutMs;
+	const operationTimeout = () => {
+		const remaining = deadline - now();
+		if (remaining <= 0) throw new Error("Timed out waiting for the exact Workspace server generation");
+		return Math.min(SSH_EXEC_TIMEOUT_MS, remaining);
+	};
 	while (true) {
 		try {
-			const serverId = await operations.readServerId();
-			const generation = await operations.readGeneration();
+			const serverId = await operations.readServerId(operationTimeout());
+			const generation = await operations.readGeneration(operationTimeout());
 			if (
 				serverId !== undefined &&
 				generation === expectedGeneration &&
-				(await operations.hasSocket(serverId)) &&
-				(await operations.probe(serverId))
+				(await operations.hasSocket(serverId, operationTimeout())) &&
+				(await operations.probe(serverId, operationTimeout()))
 			) {
 				return serverId;
 			}
 		} catch (error) {
 			if (!isSshPollingInterruption(error)) throw error;
 		}
-		if (now() >= deadline) throw new Error("Timed out waiting for the exact Workspace server generation");
-		await sleep(POLL_MS);
+		const remaining = deadline - now();
+		if (remaining <= 0) throw new Error("Timed out waiting for the exact Workspace server generation");
+		await sleep(Math.min(POLL_MS, remaining));
 	}
 }
 
 export interface WorkspaceSocketRemovalOperations {
-	hasSocket(): Promise<boolean>;
+	hasSocket(timeoutMs: number): Promise<boolean>;
 	now?(): number;
 	sleep?(delayMs: number): Promise<void>;
 }
@@ -1042,13 +1071,16 @@ export async function waitForWorkspaceSocketRemoval(
 		operations.sleep ?? ((delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
 	const deadline = now() + timeoutMs;
 	while (true) {
+		const remainingBeforeCheck = deadline - now();
+		if (remainingBeforeCheck <= 0) return false;
 		try {
-			if (!(await operations.hasSocket())) return true;
+			if (!(await operations.hasSocket(Math.min(SSH_EXEC_TIMEOUT_MS, remainingBeforeCheck)))) return true;
 		} catch (error) {
 			if (!isSshPollingInterruption(error)) throw error;
 		}
-		if (now() >= deadline) return false;
-		await sleep(POLL_MS);
+		const remaining = deadline - now();
+		if (remaining <= 0) return false;
+		await sleep(Math.min(POLL_MS, remaining));
 	}
 }
 
@@ -1086,7 +1118,8 @@ async function ensureRemoteServer(
 	if (stopped.stdout.includes("stopped") && existingSocketPath !== undefined) {
 		console.log(`Replacing unreachable or stale Workspace server with revision ${paths.revision}…`);
 		const removed = await waitForWorkspaceSocketRemoval(SERVER_STOP_TIMEOUT_MS, {
-			hasSocket: async () => (await sshExec(host, remoteCommands.hasSocket(existingSocketPath))).code === 0,
+			hasSocket: async (timeoutMs) =>
+				(await sshExec(host, remoteCommands.hasSocket(existingSocketPath), { timeoutMs })).code === 0,
 		});
 		if (!removed) throw new Error("Timed out stopping the unreachable or stale Pi Workspace server generation");
 	}
@@ -1095,17 +1128,22 @@ async function ensureRemoteServer(
 	await startRemoteServer(host, paths, toolchain, remoteCwd, existing, pluginPackages, generation);
 	try {
 		return await waitForWorkspaceGeneration(generation, SERVER_START_TIMEOUT_MS, {
-			readServerId: async () => (await readRemoteServerId(host, paths)) ?? existing,
-			readGeneration: () => readRemoteServerGeneration(host, paths),
-			hasSocket: async (serverId) =>
-				(await sshExec(host, remoteCommands.hasSocket(serverSocketPath(paths, serverId)))).code === 0,
-			probe: (serverId) =>
+			readServerId: async (timeoutMs) => (await readRemoteServerId(host, paths, timeoutMs)) ?? existing,
+			readGeneration: (timeoutMs) => readRemoteServerGeneration(host, paths, timeoutMs),
+			hasSocket: async (serverId, timeoutMs) =>
+				(
+					await sshExec(host, remoteCommands.hasSocket(serverSocketPath(paths, serverId)), {
+						timeoutMs,
+					})
+				).code === 0,
+			probe: (serverId, timeoutMs) =>
 				probeRemoteServer(
 					{
 						serverId,
 						remoteCommand: workspaceSshRemoteCommand(paths, toolchain, serverSocketPath(paths, serverId)),
 					},
 					host,
+					timeoutMs,
 				),
 		});
 	} catch (error) {
@@ -1289,7 +1327,8 @@ async function cleanupWorkspace(host: string, paths: WorkspaceRemotePaths, purge
 	if (serverId !== undefined) {
 		const socketPath = serverSocketPath(paths, serverId);
 		await waitForWorkspaceSocketRemoval(SERVER_STOP_TIMEOUT_MS, {
-			hasSocket: async () => (await sshExec(host, remoteCommands.hasSocket(socketPath))).code === 0,
+			hasSocket: async (timeoutMs) =>
+				(await sshExec(host, remoteCommands.hasSocket(socketPath), { timeoutMs })).code === 0,
 		});
 	}
 	if (purge) {
