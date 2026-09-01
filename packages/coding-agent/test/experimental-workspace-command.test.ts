@@ -305,8 +305,20 @@ describe("workspace remote paths and command construction", () => {
 		expect(command).toContain("--no-same-owner --no-same-permissions");
 		expect(command).toContain(".pi-workspace-artifact.json");
 		expect(command).toContain("sha256sum > .tree.sha256");
-		expect(command).toContain(`mv -T ${installed.revisionDir} ${installed.shareRoot}/quarantine/`);
 		expect(command).toContain(`[ ! -L ${installed.shareRoot}/current ]`);
+		const candidate = `${installed.shareRoot}/.candidate-${manifestDigest}-${artifactDigest}-$$`;
+		const fallback = `${installed.shareRoot}/releases/.repair-${manifestDigest}-${artifactDigest}-$$`;
+		const quarantine = `${installed.shareRoot}/quarantine/${manifestDigest}-${artifactDigest}-$$`;
+		const candidateVerified = command.indexOf(`cd ${candidate} && test -z`);
+		const fallbackActivated = command.indexOf(`ln -s releases/.repair-${manifestDigest}-${artifactDigest}-$$`);
+		const quarantined = command.indexOf(`mv -T ${installed.revisionDir} ${quarantine}`);
+		const replacementActivated = command.indexOf(`mv -T ${candidate} ${installed.revisionDir}`);
+		expect(candidateVerified).toBeGreaterThan(-1);
+		expect(fallbackActivated).toBeGreaterThan(candidateVerified);
+		expect(quarantined).toBeGreaterThan(fallbackActivated);
+		expect(replacementActivated).toBeGreaterThan(quarantined);
+		expect(command).toContain(`rm -rf ${installed.revisionDir} && mv -T ${quarantine} ${installed.revisionDir}`);
+		expect(command).toContain(`rm -rf ${fallback}`);
 	});
 
 	test("builds stop and purge commands that only touch MVP-owned paths", () => {

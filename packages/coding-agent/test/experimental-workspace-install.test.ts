@@ -158,6 +158,16 @@ describe("Workspace release archive", () => {
 		},
 	);
 
+	test("derives entry kind only from typeflag and normalizes directory paths", () => {
+		const directory = createTarGzip([{ path: "bin", type: "5" }]);
+		expect(inspectWorkspaceArchive(directory)).toEqual(["bin/"]);
+
+		const regularFileWithDirectorySpelling = createTarGzip([{ path: "bin/", data: "not-a-directory" }]);
+		expect(() => inspectWorkspaceArchive(regularFileWithDirectorySpelling)).toThrow(
+			/regular file path ends with a slash/,
+		);
+	});
+
 	test("rejects file and directory path collisions", () => {
 		const archive = createTarGzip([
 			{ path: "bin", data: "file" },
@@ -212,6 +222,49 @@ describe("Workspace release installation", () => {
 					platform: "darwin-arm64",
 				}),
 			).rejects.toThrow(/identity does not match/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps active current resolvable between corrupt-release quarantine and activation and rolls back failure", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-workspace-install-"));
+		try {
+			const archive = createTarGzip([
+				{ path: ".pi-workspace-artifact.json", data: IDENTITY },
+				{ path: "bin/piw", data: "replacement", mode: 0o755 },
+			]);
+			const fixture = release(archive);
+			const installed = await installWorkspaceArtifact({
+				root,
+				archive,
+				rawManifest: fixture.raw,
+				expectedManifestSha256: fixture.manifestSha256,
+				role: "client",
+				platform: "darwin-arm64",
+			});
+			await writeFile(installed.entrypoint, "corrupt", "utf8");
+			const releaseName = `${fixture.manifestSha256}-${fixture.artifact.sha256}`;
+			let injected = false;
+			await expect(
+				installWorkspaceArtifact({
+					root,
+					archive,
+					rawManifest: fixture.raw,
+					expectedManifestSha256: fixture.manifestSha256,
+					role: "client",
+					platform: "darwin-arm64",
+					onRepairQuarantined: async () => {
+						injected = true;
+						expect(await readlink(join(root, "current"))).toMatch(/^releases\/\.repair-/u);
+						expect(await readFile(join(root, "current", "bin", "piw"), "utf8")).toBe("replacement");
+						throw new Error("injected repair failure");
+					},
+				}),
+			).rejects.toThrow(/injected repair failure/);
+			expect(injected).toBe(true);
+			expect(await readlink(join(root, "current"))).toBe(`releases/${releaseName}`);
+			expect(await readFile(join(root, "current", "bin", "piw"), "utf8")).toBe("corrupt");
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

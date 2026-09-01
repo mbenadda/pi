@@ -303,14 +303,23 @@ export const remoteCommands = {
 		if (!new RegExp(`^[0-9a-f]{64}-${artifactSha256}$`, "u").test(releaseName))
 			throw new Error("Invalid release identity");
 		const temporary = `${shareRoot}/.install-${releaseName}-$$`;
+		const candidate = `${shareRoot}/.candidate-${releaseName}-$$`;
+		const fallback = `${shareRoot}/releases/.repair-${releaseName}-$$`;
 		const archive = `${temporary}.tar.gz`;
 		const next = `${shareRoot}/.current-${releaseName}-$$`;
+		const rollbackNext = `${shareRoot}/.rollback-current-${releaseName}-$$`;
 		const quarantine = `${shareRoot}/quarantine/${releaseName}-$$`;
-		const validateTarget =
-			`cd ${target} && test -z "$(find . ! -type d ! -type f -print -quit)"` +
+		const validateDirectory = (directory: string) =>
+			`cd ${directory} && test -z "$(find . ! -type d ! -type f -print -quit)"` +
 			` && find . -type f ! -name .tree.sha256 -print0 | sort -z | xargs -0 sha256sum | cmp - .tree.sha256`;
+		const activate = (targetName: string, link: string) =>
+			`rm -f ${link} && cd ${shareRoot} && ln -s releases/${targetName} ${link}` +
+			` && mv -Tf ${link} ${shareRoot}/current`;
+		const restore =
+			`rm -rf ${target} && mv -T ${quarantine} ${target}` +
+			` && if [ "$active" = 1 ]; then ${activate(releaseName, rollbackNext)} && rm -rf ${fallback}; fi`;
 		return (
-			`rm -rf ${temporary} ${archive} ${next} && cat > ${archive}` +
+			`rm -rf ${temporary} ${candidate} ${fallback} ${archive} ${next} ${rollbackNext} && cat > ${archive}` +
 			` && test "$(sha256sum ${archive} | cut -d " " -f 1)" = ${artifactSha256}` +
 			` && mkdir ${temporary} && chmod 700 ${temporary}` +
 			` && tar -xzf ${archive} -C ${temporary} --no-same-owner --no-same-permissions && rm -f ${archive}` +
@@ -320,11 +329,20 @@ export const remoteCommands = {
 			` && cd ${temporary} && find . -type f ! -name .tree.sha256 -print0 | sort -z | xargs -0 sha256sum > .tree.sha256` +
 			` && chmod 600 .tree.sha256 && cd ${shareRoot}` +
 			` && if [ -e ${shareRoot}/current ] && [ ! -L ${shareRoot}/current ]; then exit 1; fi` +
-			` && if mv -T ${temporary} ${target} 2>/dev/null; then :;` +
-			` elif (${validateTarget}); then rm -rf ${temporary};` +
-			` else cd ${shareRoot} && mv -T ${target} ${quarantine} && mv -T ${temporary} ${target}; fi` +
-			` && test -x ${entrypoint} && cd ${shareRoot} && ln -s releases/${releaseName} ${next}` +
-			` && mv -Tf ${next} ${shareRoot}/current`
+			` && if [ -e ${target} ] || [ -L ${target} ]; then` +
+			` if (${validateDirectory(target)}); then rm -rf ${temporary} && ${activate(releaseName, next)};` +
+			` else cp -a ${temporary} ${candidate} && (${validateDirectory(candidate)}) && active=0` +
+			` && if test "$(readlink ${shareRoot}/current)" = releases/${releaseName}; then` +
+			` mv -T ${temporary} ${fallback} && ${activate(`.repair-${releaseName}-$$`, next)} && active=1;` +
+			` else rm -rf ${temporary}; fi` +
+			` && if ! mv -T ${target} ${quarantine}; then` +
+			` if [ "$active" = 1 ]; then ${activate(releaseName, rollbackNext)} && rm -rf ${fallback}; fi; exit 1; fi` +
+			` && if ! mv -T ${candidate} ${target} || ! (${validateDirectory(target)}); then` +
+			` ${restore}; exit 1; fi` +
+			` && if ! (${activate(releaseName, next)}); then ${restore}; exit 1; fi` +
+			` && rm -rf ${fallback}; fi` +
+			` else mv -T ${temporary} ${target} && ${activate(releaseName, next)}; fi` +
+			` && test -x ${entrypoint}`
 		);
 	},
 	installAndBuild(paths: WorkspaceRemotePaths, toolchain: WorkspaceRemoteToolchain): string {

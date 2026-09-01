@@ -53,6 +53,7 @@ export interface InstalledWorkspaceRelease {
 
 interface TarEntry {
 	readonly path: string;
+	readonly kind: "file" | "directory";
 	readonly mode: number;
 	readonly data: Buffer;
 }
@@ -164,6 +165,7 @@ export async function installWorkspaceArtifact(options: {
 	readonly expectedManifestSha256: string;
 	readonly role: WorkspaceArtifactRole;
 	readonly platform: string;
+	readonly onRepairQuarantined?: () => Promise<void>;
 }): Promise<InstalledWorkspaceRelease> {
 	const root = resolve(options.root);
 	if (root === "/") throw new Error("Workspace install root cannot be the filesystem root");
@@ -172,7 +174,7 @@ export async function installWorkspaceArtifact(options: {
 	verifyWorkspaceArtifact(options.archive, artifact);
 	const entries = parseTarArchive(options.archive);
 	validateArtifactIdentity(entries, manifest, artifact);
-	if (!entries.some((entry) => entry.path === artifact.entrypoint && !entry.path.endsWith("/"))) {
+	if (!entries.some((entry) => entry.path === artifact.entrypoint && entry.kind === "file")) {
 		throw new Error(`Workspace artifact is missing entrypoint ${artifact.entrypoint}`);
 	}
 	await ensurePrivateDirectory(root);
@@ -192,26 +194,42 @@ export async function installWorkspaceArtifact(options: {
 		"\t",
 	)}\n`;
 	let reused = false;
+	let corruptRelease = false;
 	if (await pathExists(releaseDir)) {
 		try {
 			await verifyInstalledRelease(releaseDir, entries, receipt);
 			reused = true;
 		} catch {
-			await quarantineRelease(root, releaseDir, releaseName);
+			corruptRelease = true;
 		}
 	}
 	if (!reused) {
 		const temporaryDir = join(root, `.install-${randomUUID()}`);
-		await mkdir(temporaryDir, { mode: 0o700 });
 		try {
-			for (const entry of entries) await extractTarEntry(temporaryDir, entry);
-			await writeFile(join(temporaryDir, "install.json"), receipt, { mode: 0o600, flag: "wx" });
-			try {
-				await rename(temporaryDir, releaseDir);
-			} catch (renameError) {
-				if (!isAlreadyExists(renameError)) throw renameError;
-				await verifyInstalledRelease(releaseDir, entries, receipt);
-				reused = true;
+			await prepareInstalledRelease(temporaryDir, entries, receipt);
+			if (corruptRelease) {
+				try {
+					await verifyInstalledRelease(releaseDir, entries, receipt);
+					reused = true;
+				} catch {
+					await replaceCorruptRelease({
+						root,
+						releaseDir,
+						releaseName,
+						replacementDir: temporaryDir,
+						entries,
+						receipt,
+						...(options.onRepairQuarantined === undefined ? {} : { onQuarantined: options.onRepairQuarantined }),
+					});
+				}
+			} else {
+				try {
+					await rename(temporaryDir, releaseDir);
+				} catch (renameError) {
+					if (!isAlreadyExists(renameError)) throw renameError;
+					await verifyInstalledRelease(releaseDir, entries, receipt);
+					reused = true;
+				}
 			}
 		} finally {
 			await rm(temporaryDir, { recursive: true, force: true });
@@ -266,7 +284,7 @@ function validateArtifactIdentity(
 	manifest: WorkspaceReleaseManifest,
 	artifact: WorkspaceReleaseArtifact,
 ): void {
-	const entry = entries.find((candidate) => candidate.path === ARTIFACT_IDENTITY_PATH);
+	const entry = entries.find((candidate) => candidate.path === ARTIFACT_IDENTITY_PATH && candidate.kind === "file");
 	if (entry === undefined) throw new Error(`Workspace artifact is missing ${ARTIFACT_IDENTITY_PATH}`);
 	const identity = parseWorkspaceArtifactIdentity(entry.data.toString("utf8"));
 	if (
@@ -303,7 +321,7 @@ async function verifyInstalledRelease(
 		expectedPaths.add(entry.path);
 		const output = join(releaseDir, ...parts);
 		const stats = await lstat(output);
-		if (entry.path.endsWith("/")) {
+		if (entry.kind === "directory") {
 			if (!stats.isDirectory() || stats.isSymbolicLink())
 				throw new Error(`Workspace release directory is unsafe: ${output}`);
 			if ((stats.mode & 0o777) !== 0o700) throw new Error(`Workspace release directory mode mismatch: ${output}`);
@@ -342,10 +360,88 @@ async function collectReleasePaths(root: string, prefix = ""): Promise<string[]>
 	return paths;
 }
 
-async function quarantineRelease(root: string, releaseDir: string, releaseName: string): Promise<void> {
+async function prepareInstalledRelease(
+	directory: string,
+	entries: readonly TarEntry[],
+	receipt: string,
+): Promise<void> {
+	await mkdir(directory, { mode: 0o700 });
+	try {
+		for (const entry of entries) await extractTarEntry(directory, entry);
+		await writeFile(join(directory, "install.json"), receipt, { mode: 0o600, flag: "wx" });
+		await verifyInstalledRelease(directory, entries, receipt);
+	} catch (error) {
+		await rm(directory, { recursive: true, force: true });
+		throw error;
+	}
+}
+
+async function replaceCorruptRelease(options: {
+	readonly root: string;
+	readonly releaseDir: string;
+	readonly releaseName: string;
+	readonly replacementDir: string;
+	readonly entries: readonly TarEntry[];
+	readonly receipt: string;
+	readonly onQuarantined?: () => Promise<void>;
+}): Promise<void> {
+	const active = await currentTargetsRelease(options.root, options.releaseDir);
+	const fallbackDir = join(options.root, "releases", `.repair-${options.releaseName}-${randomUUID()}`);
+	let fallbackPrepared = false;
+	let quarantinePath: string | undefined;
+	try {
+		if (active) {
+			await prepareInstalledRelease(fallbackDir, options.entries, options.receipt);
+			fallbackPrepared = true;
+			await switchCurrent(options.root, fallbackDir);
+		}
+		quarantinePath = await quarantineRelease(options.root, options.releaseDir, options.releaseName);
+		await options.onQuarantined?.();
+		await rename(options.replacementDir, options.releaseDir);
+		await verifyInstalledRelease(options.releaseDir, options.entries, options.receipt);
+		await switchCurrent(options.root, options.releaseDir);
+	} catch (error) {
+		try {
+			if (quarantinePath !== undefined) {
+				if (await pathExists(options.releaseDir)) {
+					const quarantine = dirname(quarantinePath);
+					await rename(
+						options.releaseDir,
+						join(quarantine, `${options.releaseName}-failed-replacement-${randomUUID()}`),
+					);
+				}
+				await rename(quarantinePath, options.releaseDir);
+			}
+			if (active) await switchCurrent(options.root, options.releaseDir);
+		} catch (rollbackError) {
+			throw new AggregateError([error, rollbackError], "Workspace release repair and rollback failed");
+		}
+		throw error;
+	} finally {
+		if (fallbackPrepared && !(await currentTargetsRelease(options.root, fallbackDir))) {
+			await rm(fallbackDir, { recursive: true, force: true });
+		}
+	}
+}
+
+async function quarantineRelease(root: string, releaseDir: string, releaseName: string): Promise<string> {
 	const quarantine = join(root, "quarantine");
 	await ensurePrivateDirectory(quarantine);
-	await rename(releaseDir, join(quarantine, `${releaseName}-${randomUUID()}`));
+	const destination = join(quarantine, `${releaseName}-${randomUUID()}`);
+	await rename(releaseDir, destination);
+	return destination;
+}
+
+async function currentTargetsRelease(root: string, releaseDir: string): Promise<boolean> {
+	const current = join(root, "current");
+	try {
+		const stats = await lstat(current);
+		if (!stats.isSymbolicLink()) return false;
+		return resolve(root, await readlink(current)) === releaseDir;
+	} catch (error) {
+		if (isMissing(error)) return false;
+		throw error;
+	}
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -392,7 +488,7 @@ async function extractTarEntry(root: string, entry: TarEntry): Promise<void> {
 	const output = resolve(root, ...entry.path.split("/"));
 	if (output !== root && !output.startsWith(`${root}/`))
 		throw new Error(`Unsafe Workspace archive path: ${entry.path}`);
-	if (entry.data.length === 0 && entry.path.endsWith("/")) {
+	if (entry.kind === "directory") {
 		await mkdir(output, { recursive: true, mode: 0o700 });
 		await chmod(output, 0o700);
 		return;
@@ -433,6 +529,13 @@ function parseTarArchive(archive: Uint8Array): TarEntry[] {
 		const size = readTarOctal(header, 124, 12, "size");
 		const mode = readTarOctal(header, 100, 8, "mode");
 		if (!isSafeArchivePath(path)) throw new Error(`Unsafe Workspace archive path: ${path}`);
+		if (type !== "\0" && type !== "0" && type !== "5") {
+			throw new Error(`Unsupported Workspace archive entry type for ${path}`);
+		}
+		const kind = type === "5" ? "directory" : "file";
+		if (kind === "file" && path.endsWith("/")) {
+			throw new Error(`Workspace archive regular file path ends with a slash: ${path}`);
+		}
 		const canonicalPath = path.endsWith("/") ? path.slice(0, -1) : path;
 		if (paths.has(canonicalPath)) throw new Error(`Duplicate Workspace archive path: ${path}`);
 		paths.add(canonicalPath);
@@ -440,15 +543,13 @@ function parseTarArchive(archive: Uint8Array): TarEntry[] {
 		for (let index = 1; index < parts.length; index += 1) {
 			directoryPrefixes.add(parts.slice(0, index).join("/"));
 		}
-		if (type !== "\0" && type !== "0" && type !== "5") {
-			throw new Error(`Unsupported Workspace archive entry type for ${path}`);
-		}
-		if (type === "5" && size !== 0) throw new Error(`Workspace archive directory has data: ${path}`);
+		if (kind === "directory" && size !== 0) throw new Error(`Workspace archive directory has data: ${path}`);
 		const dataStart = offset + TAR_BLOCK_BYTES;
 		const dataEnd = dataStart + size;
 		if (dataEnd > tar.length) throw new Error(`Truncated Workspace archive entry: ${path}`);
 		entries.push({
-			path: type === "5" && !path.endsWith("/") ? `${path}/` : path,
+			path: kind === "directory" ? `${canonicalPath}/` : canonicalPath,
+			kind,
 			mode,
 			data: tar.subarray(dataStart, dataEnd),
 		});
@@ -459,8 +560,8 @@ function parseTarArchive(archive: Uint8Array): TarEntry[] {
 		throw new Error("Workspace artifact tar has invalid trailing data");
 	}
 	for (const entry of entries) {
-		const path = entry.path.endsWith("/") ? entry.path.slice(0, -1) : entry.path;
-		if (!entry.path.endsWith("/") && directoryPrefixes.has(path)) {
+		const path = entry.kind === "directory" ? entry.path.slice(0, -1) : entry.path;
+		if (entry.kind === "file" && directoryPrefixes.has(path)) {
 			throw new Error(`Workspace archive file conflicts with directory: ${path}`);
 		}
 	}
