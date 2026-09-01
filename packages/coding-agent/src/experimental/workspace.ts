@@ -302,10 +302,13 @@ export const remoteCommands = {
 		const releaseName = basename(paths.revisionDir);
 		if (!new RegExp(`^[0-9a-f]{64}-${artifactSha256}$`, "u").test(releaseName))
 			throw new Error("Invalid release identity");
-		const temporary = `${shareRoot}/.install-${releaseName}`;
+		const temporary = `${shareRoot}/.install-${releaseName}-$$`;
 		const archive = `${temporary}.tar.gz`;
-		const next = `${shareRoot}/.current-${releaseName}`;
+		const next = `${shareRoot}/.current-${releaseName}-$$`;
 		const quarantine = `${shareRoot}/quarantine/${releaseName}-$$`;
+		const validateTarget =
+			`cd ${target} && test -z "$(find . ! -type d ! -type f -print -quit)"` +
+			` && find . -type f ! -name .tree.sha256 -print0 | sort -z | xargs -0 sha256sum | cmp - .tree.sha256`;
 		return (
 			`rm -rf ${temporary} ${archive} ${next} && cat > ${archive}` +
 			` && test "$(sha256sum ${archive} | cut -d " " -f 1)" = ${artifactSha256}` +
@@ -317,8 +320,10 @@ export const remoteCommands = {
 			` && cd ${temporary} && find . -type f ! -name .tree.sha256 -print0 | sort -z | xargs -0 sha256sum > .tree.sha256` +
 			` && chmod 600 .tree.sha256 && cd ${shareRoot}` +
 			` && if [ -e ${shareRoot}/current ] && [ ! -L ${shareRoot}/current ]; then exit 1; fi` +
-			` && if [ -e ${target} ] || [ -L ${target} ]; then mv ${target} ${quarantine}; fi && mv ${temporary} ${target}` +
-			` && test -x ${entrypoint} && ln -s releases/${releaseName} ${next}` +
+			` && if mv -T ${temporary} ${target} 2>/dev/null; then :;` +
+			` elif (${validateTarget}); then rm -rf ${temporary};` +
+			` else cd ${shareRoot} && mv -T ${target} ${quarantine} && mv -T ${temporary} ${target}; fi` +
+			` && test -x ${entrypoint} && cd ${shareRoot} && ln -s releases/${releaseName} ${next}` +
 			` && mv -Tf ${next} ${shareRoot}/current`
 		);
 	},

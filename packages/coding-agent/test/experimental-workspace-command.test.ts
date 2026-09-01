@@ -299,11 +299,13 @@ describe("workspace remote paths and command construction", () => {
 		const artifactDigest = "a".repeat(64);
 		const installed = buildInstalledWorkspaceRemotePaths(HOME, REVISION, manifestDigest, artifactDigest);
 		const command = remoteCommands.installArtifact(installed, artifactDigest);
-		expect(command).toContain(`sha256sum ${installed.shareRoot}/.install-${manifestDigest}-${artifactDigest}.tar.gz`);
+		expect(command).toContain(
+			`sha256sum ${installed.shareRoot}/.install-${manifestDigest}-${artifactDigest}-$$.tar.gz`,
+		);
 		expect(command).toContain("--no-same-owner --no-same-permissions");
 		expect(command).toContain(".pi-workspace-artifact.json");
 		expect(command).toContain("sha256sum > .tree.sha256");
-		expect(command).toContain(`mv ${installed.revisionDir} ${installed.shareRoot}/quarantine/`);
+		expect(command).toContain(`mv -T ${installed.revisionDir} ${installed.shareRoot}/quarantine/`);
 		expect(command).toContain(`[ ! -L ${installed.shareRoot}/current ]`);
 	});
 
