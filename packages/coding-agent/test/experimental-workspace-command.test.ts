@@ -469,7 +469,6 @@ describe("workspace remote paths and command construction", () => {
 		expect(command).toContain("while sleep 1; do validate_install_lock_owner");
 		expect(command).toContain("read_process_start_time");
 		expect(command).not.toContain("set -- $piw_proc_fields");
-		expect(command).not.toContain("SH_WORD_SPLIT");
 		expect(command).toContain("/proc/sys/kernel/random/uuid");
 		expect(command).toContain("$piw_lock_pid:$piw_lock_start:$piw_lock_token:$piw_lock_created");
 		expect(command).toContain("stat -c %d:%i:%u:%f:%Y");
@@ -533,22 +532,36 @@ describe("workspace remote paths and command construction", () => {
 	generatedShellTest(`acquires an install lock under sh and zsh (${GENERATED_SHELL_REQUIREMENTS})`, async () => {
 		const shells = ["/bin/sh", "/bin/zsh"].filter(existsSync);
 		expect(shells).toContain("/bin/sh");
-		for (const shell of shells) {
-			const home = await mkdtemp(join(tmpdir(), "pi-workspace-lock-shell-"));
-			try {
-				const installed = buildInstalledWorkspaceRemotePaths(home, REVISION, "b".repeat(64), "a".repeat(64));
-				await mkdir(installed.shareRoot, { recursive: true, mode: 0o700 });
-				await chmod(installed.shareRoot, 0o700);
-				const transaction = remoteCommands.isInstalled(installed, "a".repeat(64));
-				const setupEnd = transaction.indexOf(" piw_lock_heartbeat=;");
-				expect(setupEnd).toBeGreaterThan(0);
-				const lock = join(installed.shareRoot, ".install-transaction-lock");
-				const command = `${transaction.slice(0, setupEnd)} piw_lock_heartbeat=; piw_lock_owner=; require_install_tools && acquire_install_lock && validate_install_lock_owner && release_install_lock && test ! -e ${lock}`;
-				const result = await runGeneratedShell(shell, command);
-				expect(result, `${shell}: ${result.stderr}`).toMatchObject({ code: 0, signal: null });
-				expect(existsSync(lock)).toBe(false);
-			} finally {
-				await rm(home, { recursive: true, force: true });
+		const sleeper = spawn("sleep", ["60"]);
+		const sleeperPid = sleeper.pid;
+		expect(sleeperPid).toBeDefined();
+		const procStat = await readFile(`/proc/${sleeperPid}/stat`, "utf8");
+		const expectedStartTime = procStat.slice(procStat.lastIndexOf(") ") + 2).split(" ")[19];
+		expect(expectedStartTime).toMatch(/^[0-9]+$/);
+		try {
+			for (const shell of shells) {
+				const home = await mkdtemp(join(tmpdir(), "pi-workspace-lock-shell-"));
+				try {
+					const installed = buildInstalledWorkspaceRemotePaths(home, REVISION, "b".repeat(64), "a".repeat(64));
+					await mkdir(installed.shareRoot, { recursive: true, mode: 0o700 });
+					await chmod(installed.shareRoot, 0o700);
+					const transaction = remoteCommands.isInstalled(installed, "a".repeat(64));
+					const setupEnd = transaction.indexOf(" piw_lock_heartbeat=;");
+					expect(setupEnd).toBeGreaterThan(0);
+					const lock = join(installed.shareRoot, ".install-transaction-lock");
+					const command = `${transaction.slice(0, setupEnd)} piw_lock_heartbeat=; piw_lock_owner=; require_install_tools && test "$(read_process_start_time ${sleeperPid})" = "${expectedStartTime}" && acquire_install_lock && validate_install_lock_owner && release_install_lock && test ! -e ${lock}`;
+					const result = await runGeneratedShell(shell, command);
+					expect(result, `${shell}: ${result.stderr}`).toMatchObject({ code: 0, signal: null });
+					expect(existsSync(lock)).toBe(false);
+				} finally {
+					await rm(home, { recursive: true, force: true });
+				}
+			}
+		} finally {
+			if (sleeper.exitCode === null) {
+				const exited = new Promise<void>((resolve) => sleeper.once("exit", () => resolve()));
+				sleeper.kill("SIGKILL");
+				await exited;
 			}
 		}
 	});
