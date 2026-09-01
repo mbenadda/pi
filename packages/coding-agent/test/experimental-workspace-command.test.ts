@@ -23,12 +23,15 @@ import { cli } from "../src/cli/experimental/cli.ts";
 import {
 	buildInstalledWorkspaceRemotePaths,
 	buildWorkspaceRemotePaths,
+	REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS,
+	REMOTE_INSTALL_CHECK_TIMEOUT_MS,
 	REMOTE_INSTALL_LOCK_WAIT_MS,
 	readWorkspaceLocalState,
 	remoteCommands,
 	requireValidRemotePath,
 	SSH_EXEC_TIMEOUT_MS,
 	serverSocketPath,
+	sshExec,
 	waitForWorkspaceGeneration,
 	workspaceSshRemoteCommand,
 	writeWorkspaceLocalState,
@@ -78,22 +81,45 @@ function remoteInstallArchive(): Buffer {
 	return gzipSync(Buffer.concat(blocks));
 }
 
+const HOMEBREW_GNU_TOOL_DIRECTORIES = ["/opt/homebrew", "/usr/local"].flatMap((prefix) => [
+	`${prefix}/opt/coreutils/libexec/gnubin`,
+	`${prefix}/opt/findutils/libexec/gnubin`,
+	`${prefix}/opt/gnu-tar/libexec/gnubin`,
+]);
+
 function shellTestPath(): string {
 	return process.platform === "darwin"
-		? [
-				"/opt/homebrew/opt/coreutils/libexec/gnubin",
-				"/opt/homebrew/opt/findutils/libexec/gnubin",
-				"/opt/homebrew/opt/gnu-tar/libexec/gnubin",
-				process.env.PATH ?? "",
-			].join(":")
+		? [...HOMEBREW_GNU_TOOL_DIRECTORIES, process.env.PATH ?? ""].join(":")
 		: (process.env.PATH ?? "");
+}
+
+function hasGeneratedShellTools(): boolean {
+	return ["stat", "find", "tar", "mv", "sha256sum"].every((tool) => {
+		const result = spawnSync(tool, ["--version"], {
+			env: { ...process.env, PATH: shellTestPath() },
+			encoding: "utf8",
+		});
+		return result.status === 0 && /GNU|coreutils/iu.test(`${result.stdout}${result.stderr}`);
+	});
+}
+
+const GENERATED_SHELL_TOOLS_AVAILABLE = hasGeneratedShellTools();
+const GENERATED_SHELL_REQUIREMENTS =
+	process.platform === "darwin"
+		? "requires: brew install coreutils findutils gnu-tar"
+		: "requires GNU coreutils, findutils, and tar";
+const GENERATED_SHELL_TEST_NAME = `executes install transactions under sh and zsh (${GENERATED_SHELL_REQUIREMENTS})`;
+
+function generatedShellTest(name: string, run: () => Promise<void>): void {
+	const selectedTest = GENERATED_SHELL_TOOLS_AVAILABLE ? test : test.skip;
+	selectedTest(name, run, 60_000);
 }
 
 function runGeneratedShell(
 	shell: string,
 	command: string,
 	input?: Uint8Array,
-): Promise<{ code: number; stderr: string }> {
+): Promise<{ code: number; signal: NodeJS.Signals | null; stderr: string }> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(shell, shell.endsWith("zsh") ? ["-f", "-c", command] : ["-c", command], {
 			env: { ...process.env, PATH: shellTestPath() },
@@ -105,7 +131,7 @@ function runGeneratedShell(
 			stderr += chunk;
 		});
 		child.once("error", reject);
-		child.once("exit", (code) => resolve({ code: code ?? 0, stderr }));
+		child.once("exit", (code, signal) => resolve({ code: code ?? 1, signal, stderr }));
 		child.stdin.end(input);
 	});
 }
@@ -418,6 +444,19 @@ describe("workspace remote paths and command construction", () => {
 		expect(command).toContain("required remote install tool missing");
 		expect(command).toContain(`-name .install-\\* ! -name .install-transaction-lock`);
 		expect(command).toContain(`-name .candidate-\\*`);
+		expect(command).toContain(`-name .lock-recovery-\\*`);
+		expect(command).toContain("while sleep 1; do validate_install_lock_owner");
+		expect(command).toContain(`touch -c ${installed.shareRoot}/.install-transaction-lock`);
+		expect(command.indexOf("validate_install_lock_owner")).toBeLessThan(
+			command.indexOf(`touch -c ${installed.shareRoot}/.install-transaction-lock`),
+		);
+		const lockAcquisition = command.slice(
+			command.indexOf("acquire_install_lock()"),
+			command.indexOf("& piw_lock_heartbeat=$!"),
+		);
+		expect(lockAcquisition.match(/continue;/gu)).toHaveLength(4);
+		expect(lockAcquisition.match(/retry_install_lock \|\| return 1; continue;/gu)).toHaveLength(4);
+		expect(command).toContain("piw_lock_attempt=$((piw_lock_attempt+1)); sleep 1");
 		expect(command).toContain(`find ${installed.shareRoot}/releases -mindepth 1 -maxdepth 1 -name .repair-\\*`);
 		const candidate = `${installed.shareRoot}/.candidate-${manifestDigest}-${artifactDigest}-$$`;
 		const fallback = `${installed.shareRoot}/releases/.repair-${manifestDigest}-${artifactDigest}-$$`;
@@ -441,11 +480,34 @@ describe("workspace remote paths and command construction", () => {
 		expect(targetActivated).toBeGreaterThan(targetModeVerified);
 	});
 
-	test("keeps the remote lock wait below the SSH execution timeout", () => {
-		expect(REMOTE_INSTALL_LOCK_WAIT_MS).toBeLessThan(SSH_EXEC_TIMEOUT_MS);
+	test("orders default SSH, lock wait, install check, and artifact upload timeouts", () => {
+		expect(SSH_EXEC_TIMEOUT_MS).toBeLessThan(REMOTE_INSTALL_LOCK_WAIT_MS);
+		expect(REMOTE_INSTALL_LOCK_WAIT_MS).toBeGreaterThanOrEqual(120_000);
+		expect(REMOTE_INSTALL_LOCK_WAIT_MS).toBeLessThan(REMOTE_INSTALL_CHECK_TIMEOUT_MS);
+		expect(REMOTE_INSTALL_CHECK_TIMEOUT_MS).toBeLessThan(REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS);
 	});
 
-	test("executes remote install, reuse, stale recovery, and concurrency under sh and zsh", async () => {
+	test("treats a signal-only generated shell exit as a failure", async () => {
+		await expect(runGeneratedShell("/bin/sh", "kill -TERM $$")).resolves.toMatchObject({
+			code: 1,
+			signal: "SIGTERM",
+		});
+	});
+
+	test("treats a signal-only SSH exit as a production failure", async () => {
+		const fakeBin = await mkdtemp(join(tmpdir(), "pi-workspace-ssh-signal-"));
+		const originalPath = process.env.PATH;
+		try {
+			await writeFile(join(fakeBin, "ssh"), "#!/bin/sh\nkill -TERM $$\n", { mode: 0o700 });
+			process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
+			await expect(sshExec("workspace-bcli-10", "true")).rejects.toThrow(/terminated by signal SIGTERM/);
+		} finally {
+			process.env.PATH = originalPath;
+			await rm(fakeBin, { recursive: true, force: true });
+		}
+	});
+
+	generatedShellTest(GENERATED_SHELL_TEST_NAME, async () => {
 		const shells = ["/bin/sh", "/bin/zsh"].filter(existsSync);
 		expect(shells).toContain("/bin/sh");
 		const archive = remoteInstallArchive();
@@ -495,6 +557,7 @@ describe("workspace remote paths and command construction", () => {
 					false,
 				);
 				expect(scratch.some((name) => name.startsWith(".current-"))).toBe(false);
+				expect(scratch.some((name) => name.startsWith(".lock-recovery-"))).toBe(false);
 				expect(
 					(await readdir(join(installed.shareRoot, "releases"))).some((name) => name.startsWith(".repair-")),
 				).toBe(false);
@@ -550,7 +613,7 @@ describe("workspace remote paths and command construction", () => {
 				await rm(home, { recursive: true, force: true });
 			}
 		}
-	}, 60_000);
+	});
 
 	test("builds stop and purge commands that only touch MVP-owned paths", () => {
 		const built = paths();

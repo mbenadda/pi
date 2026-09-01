@@ -31,7 +31,9 @@ import {
 
 const MIN_REMOTE_NODE_VERSION = [22, 19, 0];
 export const SSH_EXEC_TIMEOUT_MS = 30_000;
-export const REMOTE_INSTALL_LOCK_WAIT_MS = 20_000;
+export const REMOTE_INSTALL_LOCK_WAIT_MS = 120_000;
+export const REMOTE_INSTALL_CHECK_TIMEOUT_MS = 5 * 60_000;
+export const REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS = 10 * 60_000;
 const REMOTE_INSTALL_LOCK_STALE_SECONDS = 300;
 const STAGE_BUILD_TIMEOUT_MS = 30 * 60_000;
 const SERVER_START_TIMEOUT_MS = 180_000;
@@ -190,16 +192,26 @@ export async function sshExec(
 		}
 		options.onStderr?.(chunk);
 	});
+	const timeoutMs = options.timeoutMs ?? SSH_EXEC_TIMEOUT_MS;
+	let timedOut = false;
 	const timer = setTimeout(() => {
+		timedOut = true;
 		child.kill("SIGKILL");
-	}, options.timeoutMs ?? SSH_EXEC_TIMEOUT_MS);
+	}, timeoutMs);
 	timer.unref();
-	const code = await new Promise<number>((resolve, reject) => {
-		child.once("error", reject);
-		child.once("exit", (exitCode) => resolve(exitCode ?? 1));
-	});
-	clearTimeout(timer);
-	return { code, stdout, stderr };
+	let outcome: { readonly code: number | null; readonly signal: NodeJS.Signals | null };
+	try {
+		outcome = await new Promise((resolve, reject) => {
+			child.once("error", reject);
+			child.once("exit", (code, signal) => resolve({ code, signal }));
+		});
+	} finally {
+		clearTimeout(timer);
+	}
+	if (timedOut) throw new Error(`SSH command timed out after ${timeoutMs}ms and was killed: ${host}`);
+	if (outcome.code === null)
+		throw new Error(`SSH command to ${host} was terminated by signal ${outcome.signal ?? "unknown"}`);
+	return { code: outcome.code, stdout, stderr };
 }
 
 export interface LocalRepository {
@@ -239,34 +251,48 @@ function remoteInstallTransactionShell(shareRoot: string): string {
 		`require_install_tools() { for piw_tool in stat date find sha256sum sort xargs cmp readlink mv tar mkdir chmod rm cp ln touch sleep id cut cat; do` +
 		` command -v "$piw_tool" >/dev/null 2>&1 || { printf 'piw: required remote install tool missing: %s\\n' "$piw_tool" >&2; return 1; }; done;` +
 		` stat -c %u ${shareRoot} >/dev/null 2>&1 || { printf 'piw: remote install requires GNU-compatible stat\\n' >&2; return 1; }; };` +
+		` retry_install_lock() {` +
+		` if [ "$piw_lock_attempt" -ge ${waitSeconds} ]; then` +
+		` printf 'piw: timed out waiting for remote install lock after ${waitSeconds}s\\n' >&2; return 1; fi;` +
+		` piw_lock_attempt=$((piw_lock_attempt+1)); sleep 1 || return 1; };` +
+		` validate_install_lock_owner() {` +
+		` test -d ${lock} && test ! -L ${lock}` +
+		` && test "$(stat -c %u ${lock} 2>/dev/null)" = "$(id -u)"` +
+		` && test -f ${lock}/owner && test ! -L ${lock}/owner` +
+		` && test "$(stat -c %u ${lock}/owner 2>/dev/null)" = "$(id -u)"` +
+		` && test "$(cat ${lock}/owner 2>/dev/null)" = "$piw_lock_owner"` +
+		` && piw_lock_owner_pid=\${piw_lock_owner%%:*}` +
+		` && case "$piw_lock_owner_pid" in ''|*[!0-9]*) false;; *) kill -0 "$piw_lock_owner_pid" 2>/dev/null;; esac; };` +
 		` acquire_install_lock() { piw_lock_attempt=0; while :; do` +
 		` if (umask 077; mkdir ${lock}) 2>/dev/null; then` +
-		` printf %s "$$" > ${lock}/owner && chmod 600 ${lock}/owner || { rm -rf ${lock}; return 1; }; chmod 700 ${lock}; break; fi;` +
+		` piw_lock_owner="$$:$(date +%s):$piw_lock_attempt";` +
+		` printf %s "$piw_lock_owner" > ${lock}/owner && chmod 600 ${lock}/owner` +
+		` && chmod 700 ${lock} || { rm -rf ${lock}; return 1; }; break; fi;` +
 		` if ! test -d ${lock} || test -L ${lock}; then` +
-		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then continue; fi;` +
+		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then retry_install_lock || return 1; continue; fi;` +
 		` printf 'piw: unsafe remote install lock: ${lock}\\n' >&2; return 1; fi;` +
 		` piw_lock_uid=$(stat -c %u ${lock} 2>/dev/null) || {` +
-		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then continue; fi; return 1; };` +
+		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then retry_install_lock || return 1; continue; fi; return 1; };` +
 		` test "$piw_lock_uid" = "$(id -u)" || { printf 'piw: unsafe remote install lock ownership: ${lock}\\n' >&2; return 1; };` +
 		` piw_lock_now=$(date +%s) && piw_lock_mtime=$(stat -c %Y ${lock} 2>/dev/null) || {` +
-		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then continue; fi; return 1; };` +
+		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then retry_install_lock || return 1; continue; fi; return 1; };` +
 		` case "$piw_lock_now:$piw_lock_mtime" in *[!0-9:]*|:*) return 1;; esac;` +
-		` if [ $((piw_lock_now-piw_lock_mtime)) -ge ${REMOTE_INSTALL_LOCK_STALE_SECONDS} ]; then` +
+		` piw_existing_owner=$(cat ${lock}/owner 2>/dev/null || true); piw_existing_pid=\${piw_existing_owner%%:*};` +
+		` piw_existing_alive=0; case "$piw_existing_pid" in ''|*[!0-9]*) :;; *)` +
+		` kill -0 "$piw_existing_pid" 2>/dev/null && piw_existing_alive=1;; esac;` +
+		` if [ "$piw_existing_alive" = 0 ] && [ $((piw_lock_now-piw_lock_mtime)) -ge ${REMOTE_INSTALL_LOCK_STALE_SECONDS} ]; then` +
 		` piw_stale_lock=${shareRoot}/.lock-recovery-$$-$piw_lock_attempt;` +
 		` if mv -T ${lock} "$piw_stale_lock" 2>/dev/null; then` +
 		` test -d "$piw_stale_lock" && test ! -L "$piw_stale_lock"` +
 		` && test "$(stat -c %u "$piw_stale_lock")" = "$(id -u)"` +
 		` || { printf 'piw: unsafe stale remote install lock\\n' >&2; return 1; };` +
-		` rm -rf "$piw_stale_lock" || return 1; continue; fi; fi;` +
-		` if [ "$piw_lock_attempt" -ge ${waitSeconds} ]; then` +
-		` printf 'piw: timed out waiting for remote install lock after ${waitSeconds}s\\n' >&2; return 1; fi;` +
-		` piw_lock_attempt=$((piw_lock_attempt+1)); sleep 1 || return 1; done;` +
-		` (while sleep 1; do touch ${lock} 2>/dev/null || exit; done) & piw_lock_heartbeat=$!; };` +
+		` retry_install_lock || return 1; continue; fi; fi;` +
+		` retry_install_lock || return 1; done;` +
+		` (while sleep 1; do validate_install_lock_owner || exit; touch -c ${lock} 2>/dev/null || exit; done)` +
+		` & piw_lock_heartbeat=$!; };` +
 		` release_install_lock() { piw_release_result=0;` +
 		` if [ -n "$piw_lock_heartbeat" ]; then kill "$piw_lock_heartbeat" 2>/dev/null || true; wait "$piw_lock_heartbeat" 2>/dev/null || true; fi;` +
-		` test -d ${lock} && test ! -L ${lock}` +
-		` && test "$(stat -c %u ${lock})" = "$(id -u)"` +
-		` && test "$(cat ${lock}/owner 2>/dev/null)" = "$$"` +
+		` validate_install_lock_owner` +
 		` || { printf 'piw: remote install lock ownership changed while held\\n' >&2; piw_release_result=1; };` +
 		` if [ "$piw_release_result" = 0 ]; then rm -rf ${lock} || piw_release_result=1; fi;` +
 		` return "$piw_release_result"; };`
@@ -275,25 +301,27 @@ function remoteInstallTransactionShell(shareRoot: string): string {
 
 function remoteInstallPruneShell(shareRoot: string, releases: string): string {
 	return (
-		`prune_install_scratch() { piw_active_target=;` +
+		`prune_install_scratch() { validate_install_lock_owner || return 1; piw_active_target=;` +
 		` if [ -e ${shareRoot}/current ] || [ -L ${shareRoot}/current ]; then` +
 		` test -L ${shareRoot}/current || return 1; piw_active_target=$(readlink ${shareRoot}/current) || return 1; fi;` +
 		` find ${shareRoot} -mindepth 1 -maxdepth 1 \\( \\( -name .install-\\* ! -name .install-transaction-lock \\)` +
-		` -o -name .candidate-\\* -o -name .current-\\* -o -name .reuse-current-\\* -o -name .rollback-current-\\* \\) -print` +
+		` -o -name .lock-recovery-\\* -o -name .candidate-\\* -o -name .current-\\*` +
+		` -o -name .reuse-current-\\* -o -name .rollback-current-\\* \\) -print` +
 		` | while IFS= read -r piw_scratch; do piw_scratch_name=\${piw_scratch##*/};` +
 		` piw_relative_scratch=\${piw_scratch#${shareRoot}/};` +
 		` if [ "$piw_active_target" = "$piw_relative_scratch" ] || [ "$piw_preserve_fallback" = "$piw_scratch" ]; then continue; fi;` +
 		` case "$piw_scratch_name" in .current-*|.reuse-current-*|.rollback-current-*)` +
-		` test -L "$piw_scratch" || return 1;; .candidate-*) test -d "$piw_scratch" && test ! -L "$piw_scratch" || return 1;;` +
+		` test -L "$piw_scratch" || return 1;; .candidate-*|.lock-recovery-*)` +
+		` test -d "$piw_scratch" && test ! -L "$piw_scratch" || return 1;;` +
 		` .install-*) test ! -L "$piw_scratch" && { test -d "$piw_scratch" || test -f "$piw_scratch"; } || return 1;;` +
 		` *) return 1;; esac; test "$(stat -c %u "$piw_scratch")" = "$(id -u)" || return 1;` +
-		` rm -rf "$piw_scratch" || return 1; done || return 1;` +
+		` validate_install_lock_owner || return 1; rm -rf "$piw_scratch" || return 1; done || return 1;` +
 		` find ${releases} -mindepth 1 -maxdepth 1 -name .repair-\\* -print` +
 		` | while IFS= read -r piw_scratch; do piw_relative_scratch=\${piw_scratch#${shareRoot}/};` +
 		` if [ "$piw_active_target" = "$piw_relative_scratch" ] || [ "$piw_preserve_fallback" = "$piw_scratch" ]; then continue; fi;` +
 		` test -d "$piw_scratch" && test ! -L "$piw_scratch"` +
 		` && test "$(stat -c %u "$piw_scratch")" = "$(id -u)" || return 1;` +
-		` rm -rf "$piw_scratch" || return 1; done; };`
+		` validate_install_lock_owner || return 1; rm -rf "$piw_scratch" || return 1; done; };`
 	);
 }
 
@@ -361,7 +389,7 @@ export const remoteCommands = {
 			`test -d ${directory} && test ! -L ${directory} && test "$(stat -c %u ${directory})" = "$(id -u)"`;
 		return (
 			`${remoteInstallTransactionShell(shareRoot)} ${remoteInstallPruneShell(shareRoot, releases)}` +
-			` piw_lock_heartbeat=; piw_preserve_fallback=;` +
+			` piw_lock_heartbeat=; piw_lock_owner=; piw_preserve_fallback=;` +
 			` cleanup_workspace_reuse() { piw_reuse_result=$?;` +
 			` prune_install_scratch || printf 'piw: warning: failed to prune remote install scratch after activation\\n' >&2;` +
 			` rm -f ${next}; release_install_lock || { [ "$piw_reuse_result" != 0 ] || piw_reuse_result=1; };` +
@@ -425,7 +453,7 @@ export const remoteCommands = {
 			` trap - EXIT HUP INT TERM; exit "$piw_install_result"; };`;
 		return (
 			`${remoteInstallTransactionShell(shareRoot)} ${remoteInstallPruneShell(shareRoot, releases)}` +
-			` ${restore} ${cleanup} piw_lock_heartbeat=; piw_preserve_fallback=; piw_repair_active=0;` +
+			` ${restore} ${cleanup} piw_lock_heartbeat=; piw_lock_owner=; piw_preserve_fallback=; piw_repair_active=0;` +
 			` require_install_tools && ${ownedDirectory(shareRoot)} && ${ownedDirectory(releases)}` +
 			` && ${ownedDirectory(quarantineRoot)} && acquire_install_lock` +
 			` && trap cleanup_workspace_install EXIT HUP INT TERM && prune_install_scratch` +
@@ -607,11 +635,11 @@ export async function stageRemoteRevision(
 	archive.stdout.pipe(extract.stdin);
 	const archiveCode = new Promise<number>((resolve, reject) => {
 		archive.once("error", reject);
-		archive.once("exit", (code) => resolve(code ?? 0));
+		archive.once("exit", (code) => resolve(code ?? 1));
 	});
 	const extractCode = new Promise<number>((resolve, reject) => {
 		extract.once("error", reject);
-		extract.once("exit", (code) => resolve(code ?? 0));
+		extract.once("exit", (code) => resolve(code ?? 1));
 	});
 	const [archiveExit, extractExit] = await Promise.all([archiveCode, extractCode]);
 	if (archiveExit !== 0) throw new Error(`git archive failed: ${archiveStderr.trim()}`);
@@ -635,7 +663,9 @@ export async function installRemoteWorkspaceArtifact(
 	paths: WorkspaceRemotePaths,
 	bundle: BundledWorkspaceServer,
 ): Promise<boolean> {
-	const installed = await sshExec(host, remoteCommands.isInstalled(paths, bundle.artifact.sha256));
+	const installed = await sshExec(host, remoteCommands.isInstalled(paths, bundle.artifact.sha256), {
+		timeoutMs: REMOTE_INSTALL_CHECK_TIMEOUT_MS,
+	});
 	if (installed.code === 0) return false;
 	console.log(`Installing Workspace backend ${bundle.manifest.revision} on ${host}…`);
 	const command = buildSshCommand(host, remoteCommands.installArtifact(paths, bundle.artifact.sha256));
@@ -645,13 +675,39 @@ export async function installRemoteWorkspaceArtifact(
 	child.stderr.on("data", (chunk: string) => {
 		stderr = (stderr + chunk).slice(-MAX_SSH_CAPTURE_BYTES);
 	});
+	const exit = new Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>(
+		(resolve, reject) => {
+			child.once("error", reject);
+			child.once("exit", (code, signal) => resolve({ code, signal }));
+		},
+	);
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		child.kill("SIGKILL");
+	}, REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS);
+	timer.unref();
 	child.stdin.end(bundle.archive);
-	const code = await new Promise<number>((resolve, reject) => {
-		child.once("error", reject);
-		child.once("exit", (exitCode) => resolve(exitCode ?? 0));
+	let outcome: { readonly code: number | null; readonly signal: NodeJS.Signals | null };
+	try {
+		outcome = await exit;
+	} finally {
+		clearTimeout(timer);
+	}
+	if (timedOut) {
+		throw new Error(
+			`Remote Workspace backend install timed out after ${REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS}ms and was killed`,
+		);
+	}
+	if (outcome.code === null) {
+		throw new Error(`Remote Workspace backend install was terminated by signal ${outcome.signal ?? "unknown"}`);
+	}
+	if (outcome.code !== 0) {
+		throw new Error(`Remote Workspace backend install failed (exit ${outcome.code}): ${stderr.trim()}`);
+	}
+	const verified = await sshExec(host, remoteCommands.isInstalled(paths, bundle.artifact.sha256), {
+		timeoutMs: REMOTE_INSTALL_CHECK_TIMEOUT_MS,
 	});
-	if (code !== 0) throw new Error(`Remote Workspace backend install failed: ${stderr.trim()}`);
-	const verified = await sshExec(host, remoteCommands.isInstalled(paths, bundle.artifact.sha256));
 	if (verified.code !== 0) throw new Error("Remote Workspace backend install did not activate the exact artifact");
 	return true;
 }
