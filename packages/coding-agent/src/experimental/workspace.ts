@@ -207,9 +207,7 @@ export async function sshExec(
 	options: SshExecOptions = {},
 ): Promise<SshExecResult> {
 	const args = buildSshCommand(host, remoteCommand);
-	const child = spawn(args[0]!, args.slice(1), {
-		stdio: ["ignore", "pipe", "pipe"],
-	});
+	const child = spawn(args[0]!, args.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
 	let stdout = "";
 	let stderr = "";
 	child.stdout.setEncoding("utf8");
@@ -233,10 +231,7 @@ export async function sshExec(
 		child.kill("SIGKILL");
 	}, timeoutMs);
 	timer.unref();
-	let outcome: {
-		readonly code: number | null;
-		readonly signal: NodeJS.Signals | null;
-	};
+	let outcome: { readonly code: number | null; readonly signal: NodeJS.Signals | null };
 	try {
 		outcome = await new Promise((resolve, reject) => {
 			child.once("error", reject);
@@ -271,9 +266,7 @@ export function resolveLocalRepository(): LocalRepository {
 	if (root === undefined) {
 		throw new Error("pi workspace requires a Git checkout of Pi to stage the exact revision");
 	}
-	const revisionResult = spawnSync("git", ["-C", root, "rev-parse", "HEAD"], {
-		encoding: "utf8",
-	});
+	const revisionResult = spawnSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" });
 	if (revisionResult.error !== undefined || revisionResult.status !== 0) {
 		throw new Error(`Failed to resolve the local Pi revision in ${root}`);
 	}
@@ -776,9 +769,7 @@ export async function installRemoteWorkspaceArtifact(
 	if (installed.code === 0) return false;
 	console.log(`Installing Workspace backend ${bundle.manifest.revision} on ${host}…`);
 	const command = buildSshCommand(host, remoteCommands.installArtifact(paths, bundle.artifact.sha256));
-	const child = spawn(command[0]!, command.slice(1), {
-		stdio: ["pipe", "pipe", "pipe"],
-	});
+	const child = spawn(command[0]!, command.slice(1), { stdio: ["pipe", "pipe", "pipe"] });
 	let stderr = "";
 	child.stderr.setEncoding("utf8");
 	child.stderr.on("data", (chunk: string) => {
@@ -788,13 +779,12 @@ export async function installRemoteWorkspaceArtifact(
 	child.stdin.on("error", (error) => {
 		stdinError = error;
 	});
-	const exit = new Promise<{
-		readonly code: number | null;
-		readonly signal: NodeJS.Signals | null;
-	}>((resolve, reject) => {
-		child.once("error", reject);
-		child.once("exit", (code, signal) => resolve({ code, signal }));
-	});
+	const exit = new Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>(
+		(resolve, reject) => {
+			child.once("error", reject);
+			child.once("exit", (code, signal) => resolve({ code, signal }));
+		},
+	);
 	let timedOut = false;
 	const timer = setTimeout(() => {
 		timedOut = true;
@@ -807,10 +797,7 @@ export async function installRemoteWorkspaceArtifact(
 		stdinError = error instanceof Error ? error : new Error(String(error));
 		child.stdin.destroy();
 	}
-	let outcome: {
-		readonly code: number | null;
-		readonly signal: NodeJS.Signals | null;
-	};
+	let outcome: { readonly code: number | null; readonly signal: NodeJS.Signals | null };
 	try {
 		outcome = await exit;
 	} finally {
@@ -866,10 +853,7 @@ export async function probeRemoteServer(
 ): Promise<boolean> {
 	const client = new Client({
 		serverId: requireValidServerId(connection.serverId),
-		transportFactory: createSshTransportFactory({
-			host,
-			remoteCommand: connection.remoteCommand,
-		}),
+		transportFactory: createSshTransportFactory({ host, remoteCommand: connection.remoteCommand }),
 	});
 	let timer: NodeJS.Timeout | undefined;
 	try {
@@ -938,11 +922,7 @@ export async function readWorkspaceLocalState(
 	) {
 		return undefined;
 	}
-	return {
-		revision: parsed.revision,
-		serverId: parsed.serverId,
-		sessionId: parsed.sessionId,
-	};
+	return { revision: parsed.revision, serverId: parsed.serverId, sessionId: parsed.sessionId };
 }
 
 export async function writeWorkspaceLocalState(
@@ -954,10 +934,7 @@ export async function writeWorkspaceLocalState(
 	const path = localStatePath(options.root ?? workspaceLocalStateRoot(), host, remoteCwd);
 	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	await chmod(dirname(path), 0o700);
-	await writeFile(path, `${JSON.stringify(state, null, "\t")}\n`, {
-		encoding: "utf8",
-		mode: 0o600,
-	});
+	await writeFile(path, `${JSON.stringify(state, null, "\t")}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
 /** Reads the logical remote server identity if the MVP has created one before. */
@@ -1101,10 +1078,7 @@ async function ensureRemoteServer(
 			runningGeneration !== undefined &&
 			socket.code === 0 &&
 			(await probeRemoteServer(
-				{
-					serverId: existing,
-					remoteCommand: workspaceSshRemoteCommand(paths, toolchain, existingSocketPath),
-				},
+				{ serverId: existing, remoteCommand: workspaceSshRemoteCommand(paths, toolchain, existingSocketPath) },
 				host,
 			))
 		) {
@@ -1242,11 +1216,7 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 		command.pluginPackages ?? defaultPluginPackages(paths),
 	);
 	const sessionId = await resolveSessionId(command, serverId, remoteCwd);
-	await writeWorkspaceLocalState(host, remoteCwd, {
-		revision: paths.revision,
-		serverId,
-		sessionId,
-	});
+	await writeWorkspaceLocalState(host, remoteCwd, { revision: paths.revision, serverId, sessionId });
 
 	console.log(`Workspace ${host}: server ${serverId}, session ${sessionId}`);
 	await runClientTui({
@@ -1301,10 +1271,7 @@ async function reportWorkspaceStatus(
 		const alive =
 			socket.code === 0 &&
 			(await probeRemoteServer(
-				{
-					serverId,
-					remoteCommand: workspaceSshRemoteCommand(paths, toolchain, socketPath),
-				},
+				{ serverId, remoteCommand: workspaceSshRemoteCommand(paths, toolchain, socketPath) },
 				host,
 			));
 		const runningGeneration = await readRemoteServerGeneration(host, paths);

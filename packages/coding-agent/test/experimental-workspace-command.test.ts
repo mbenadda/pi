@@ -110,24 +110,11 @@ function remoteInstallArchive(): Buffer {
 	return gzipSync(Buffer.concat(blocks));
 }
 
-const HOMEBREW_GNU_TOOL_DIRECTORIES = ["/opt/homebrew", "/usr/local"].flatMap((prefix) => [
-	`${prefix}/opt/coreutils/libexec/gnubin`,
-	`${prefix}/opt/findutils/libexec/gnubin`,
-	`${prefix}/opt/gnu-tar/libexec/gnubin`,
-]);
-
-function shellTestPath(): string {
-	return process.platform === "darwin"
-		? [...HOMEBREW_GNU_TOOL_DIRECTORIES, process.env.PATH ?? ""].join(":")
-		: (process.env.PATH ?? "");
-}
-
 function hasGeneratedShellTools(): boolean {
 	return (
 		process.platform === "linux" &&
 		["stat", "find", "tar", "mv", "sha256sum"].every((tool) => {
 			const result = spawnSync(tool, ["--version"], {
-				env: { ...process.env, PATH: shellTestPath() },
 				encoding: "utf8",
 			});
 			return result.status === 0 && /GNU|coreutils/iu.test(`${result.stdout}${result.stderr}`);
@@ -157,7 +144,6 @@ function runGeneratedShell(
 ): Promise<{ code: number; signal: NodeJS.Signals | null; stderr: string }> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(shell, shell.endsWith("zsh") ? ["-f", "-c", command] : ["-c", command], {
-			env: { ...process.env, PATH: shellTestPath() },
 			stdio: ["pipe", "ignore", "pipe"],
 		});
 		let stderr = "";
@@ -346,12 +332,7 @@ describe("workspace remote paths and command construction", () => {
 			socket,
 		);
 		expect(standaloneCommand).toEqual([standalone.bridgePath, socket]);
-		expect(
-			buildSshSpawnArgs({
-				host: "workspace-bcli-10",
-				remoteCommand: standaloneCommand,
-			}),
-		).toEqual([
+		expect(buildSshSpawnArgs({ host: "workspace-bcli-10", remoteCommand: standaloneCommand })).toEqual([
 			"ssh",
 			"-o",
 			"BatchMode=yes",
@@ -540,24 +521,18 @@ describe("workspace remote paths and command construction", () => {
 		expect(REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS).toBeLessThan(REMOTE_INSTALL_LOCK_HARD_STALE_MS);
 	});
 
-	if (process.platform === "linux") {
-		test("treats a signal-only generated shell exit as a failure", async () => {
-			await expect(runGeneratedShell("/bin/sh", "kill -TERM $$")).resolves.toMatchObject({
-				code: 1,
-				signal: "SIGTERM",
-			});
+	test("treats a signal-only generated shell exit as a failure", async () => {
+		await expect(runGeneratedShell("/bin/sh", "kill -TERM $$")).resolves.toMatchObject({
+			code: 1,
+			signal: "SIGTERM",
 		});
-	} else {
-		test.skip(`treats a signal-only generated shell exit as a failure; unsupported on ${process.platform}`);
-	}
+	});
 
 	test("treats a signal-only SSH exit as a production failure", async () => {
 		const fakeBin = await mkdtemp(join(tmpdir(), "pi-workspace-ssh-signal-"));
 		const originalPath = process.env.PATH;
 		try {
-			await writeFile(join(fakeBin, "ssh"), "#!/bin/sh\nkill -TERM $$\n", {
-				mode: 0o700,
-			});
+			await writeFile(join(fakeBin, "ssh"), "#!/bin/sh\nkill -TERM $$\n", { mode: 0o700 });
 			process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
 			await expect(sshExec("workspace-bcli-10", "true")).rejects.toBeInstanceOf(SshCommandSignalError);
 		} finally {
@@ -570,9 +545,7 @@ describe("workspace remote paths and command construction", () => {
 		const fakeBin = await mkdtemp(join(tmpdir(), "pi-workspace-ssh-timeout-"));
 		const originalPath = process.env.PATH;
 		try {
-			await writeFile(join(fakeBin, "ssh"), "#!/bin/sh\nexec sleep 60\n", {
-				mode: 0o700,
-			});
+			await writeFile(join(fakeBin, "ssh"), "#!/bin/sh\nexec sleep 60\n", { mode: 0o700 });
 			process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
 			await expect(sshExec("workspace-bcli-10", "true", { timeoutMs: 10 })).rejects.toBeInstanceOf(
 				SshCommandTimeoutError,
@@ -650,14 +623,8 @@ describe("workspace remote paths and command construction", () => {
 			try {
 				const installed = buildInstalledWorkspaceRemotePaths(home, REVISION, manifestDigest, artifactDigest);
 				await Promise.all([
-					mkdir(join(installed.shareRoot, "releases"), {
-						recursive: true,
-						mode: 0o700,
-					}),
-					mkdir(join(installed.shareRoot, "quarantine"), {
-						recursive: true,
-						mode: 0o700,
-					}),
+					mkdir(join(installed.shareRoot, "releases"), { recursive: true, mode: 0o700 }),
+					mkdir(join(installed.shareRoot, "quarantine"), { recursive: true, mode: 0o700 }),
 				]);
 				await chmod(installed.shareRoot, 0o700);
 				const install = remoteCommands.installArtifact(installed, artifactDigest);
@@ -734,10 +701,7 @@ describe("workspace remote paths and command construction", () => {
 					await utimes(lock, new Date(0), new Date(0));
 					const unreadableFaultBin = join(home, "unreadable-fault-bin");
 					await mkdir(unreadableFaultBin, { mode: 0o700 });
-					const realCat = spawnSync("sh", ["-c", "command -v cat"], {
-						env: { ...process.env, PATH: shellTestPath() },
-						encoding: "utf8",
-					}).stdout.trim();
+					const realCat = spawnSync("sh", ["-c", "command -v cat"], { encoding: "utf8" }).stdout.trim();
 					await writeFile(
 						join(unreadableFaultBin, "cat"),
 						`#!/bin/sh\ncase "$1" in */owner) value=$(${realCat} "$1" 2>/dev/null || true); if [ "$value" = simulated-unreadable-owner ]; then exit 93; fi;; esac\nexec ${realCat} "$@"\n`,
@@ -745,7 +709,7 @@ describe("workspace remote paths and command construction", () => {
 					);
 					const unreadableRecovery = await runGeneratedShell(
 						shell,
-						`PATH=${unreadableFaultBin}:${shellTestPath()}; export PATH; ${reuse}`,
+						`PATH=${unreadableFaultBin}:$PATH; export PATH; ${reuse}`,
 					);
 					expect(unreadableRecovery).toMatchObject({ code: 0 });
 					expect(unreadableRecovery.stderr).toContain("recovering stale remote install lock (unreadable-owner)");
@@ -755,10 +719,7 @@ describe("workspace remote paths and command construction", () => {
 					await utimes(lock, new Date(0), new Date(0));
 					const moveFaultBin = join(home, "move-fault-bin");
 					await mkdir(moveFaultBin, { mode: 0o700 });
-					const realMvForRecovery = spawnSync("sh", ["-c", "command -v mv"], {
-						env: { ...process.env, PATH: shellTestPath() },
-						encoding: "utf8",
-					}).stdout.trim();
+					const realMvForRecovery = spawnSync("sh", ["-c", "command -v mv"], { encoding: "utf8" }).stdout.trim();
 					await writeFile(
 						join(moveFaultBin, "mv"),
 						`#!/bin/sh\ncase "$2:$3" in */.install-transaction-lock:*/.lock-recovery-*) rm -rf "$2"; ln -s missing "$2";; esac\nexec ${realMvForRecovery} "$@"\n`,
@@ -766,20 +727,16 @@ describe("workspace remote paths and command construction", () => {
 					);
 					const racedRecovery = await runGeneratedShell(
 						shell,
-						`PATH=${moveFaultBin}:${shellTestPath()}; export PATH; ${reuse}`,
+						`PATH=${moveFaultBin}:$PATH; export PATH; ${reuse}`,
 					);
 					expect(racedRecovery.code).not.toBe(0);
 					expect(racedRecovery.stderr).toContain("unsafe stale remote install lock after recovery move");
-					expect(await runGeneratedShell(shell, reuse)).toMatchObject({
-						code: 0,
-					});
+					expect(await runGeneratedShell(shell, reuse)).toMatchObject({ code: 0 });
 
 					await mkdir(lock, { mode: 0o700 });
 					await writeFile(join(lock, "owner"), "999999999:1:dead-owner-token:1", "utf8");
 					await utimes(lock, new Date(0), new Date(0));
-					expect(await runGeneratedShell(shell, reuse)).toMatchObject({
-						code: 0,
-					});
+					expect(await runGeneratedShell(shell, reuse)).toMatchObject({ code: 0 });
 
 					const unrelated = spawn("sleep", ["60"], { stdio: "ignore" });
 					try {
@@ -796,15 +753,11 @@ describe("workspace remote paths and command construction", () => {
 							"utf8",
 						);
 						await utimes(lock, new Date(0), new Date(0));
-						expect(await runGeneratedShell(shell, reuse)).toMatchObject({
-							code: 0,
-						});
+						expect(await runGeneratedShell(shell, reuse)).toMatchObject({ code: 0 });
 
 						await mkdir(lock, { mode: 0o700 });
 						await writeFile(join(lock, "owner"), `${unrelated.pid}:${processStart}:hard-ceiling-token:1`, "utf8");
-						expect(await runGeneratedShell(shell, reuse)).toMatchObject({
-							code: 0,
-						});
+						expect(await runGeneratedShell(shell, reuse)).toMatchObject({ code: 0 });
 					} finally {
 						unrelated.kill("SIGKILL");
 					}
@@ -813,7 +766,6 @@ describe("workspace remote paths and command construction", () => {
 					const faultBin = join(home, "fault-bin");
 					await mkdir(faultBin, { mode: 0o700 });
 					const realMv = spawnSync("sh", ["-c", "command -v mv"], {
-						env: { ...process.env, PATH: shellTestPath() },
 						encoding: "utf8",
 					}).stdout.trim();
 					const faultMv = join(faultBin, "mv");
@@ -824,7 +776,7 @@ describe("workspace remote paths and command construction", () => {
 					);
 					const failedRepair = await runGeneratedShell(
 						shell,
-						`PATH=${faultBin}:${shellTestPath()}; export PATH; ${install}`,
+						`PATH=${faultBin}:$PATH; export PATH; ${install}`,
 						archive,
 					);
 					expect(failedRepair.code).not.toBe(0);
@@ -1026,24 +978,10 @@ describe("workspace local state", () => {
 	test("persists reconnect identity under 0700/0600 permissions", async () => {
 		const root = await mkdtemp(join("/tmp", "pi-workspace-state-"));
 		try {
-			expect(
-				await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, {
-					root,
-				}),
-			).toBeUndefined();
-			const state = {
-				revision: REVISION,
-				serverId: SERVER_ID,
-				sessionId: "00000000-0000-4000-8000-000000000002",
-			};
-			await writeWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, state, {
-				root,
-			});
-			expect(
-				await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, {
-					root,
-				}),
-			).toEqual(state);
+			expect(await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, { root })).toBeUndefined();
+			const state = { revision: REVISION, serverId: SERVER_ID, sessionId: "00000000-0000-4000-8000-000000000002" };
+			await writeWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, state, { root });
+			expect(await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, { root })).toEqual(state);
 			const stateDirectory = await stat(join(root, "workspace-bcli-10"));
 			expect(stateDirectory.mode & 0o777).toBe(0o700);
 		} finally {
@@ -1054,22 +992,12 @@ describe("workspace local state", () => {
 	test("ignores corrupted local state", async () => {
 		const root = await mkdtemp(join("/tmp", "pi-workspace-state-"));
 		try {
-			const state = {
-				revision: REVISION,
-				serverId: SERVER_ID,
-				sessionId: "00000000-0000-4000-8000-000000000002",
-			};
-			await writeWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, state, {
-				root,
-			});
+			const state = { revision: REVISION, serverId: SERVER_ID, sessionId: "00000000-0000-4000-8000-000000000002" };
+			await writeWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, state, { root });
 			const path = join(root, "workspace-bcli-10");
 			const files = await readdir(path);
 			await writeFile(join(path, files[0]!), "{invalid", "utf8");
-			expect(
-				await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, {
-					root,
-				}),
-			).toBeUndefined();
+			expect(await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, { root })).toBeUndefined();
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
