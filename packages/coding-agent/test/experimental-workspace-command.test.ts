@@ -23,16 +23,23 @@ import { cli } from "../src/cli/experimental/cli.ts";
 import {
 	buildInstalledWorkspaceRemotePaths,
 	buildWorkspaceRemotePaths,
+	installRemoteWorkspaceArtifact,
 	REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS,
+	REMOTE_ARTIFACT_INSTALL_WORK_TIMEOUT_MS,
 	REMOTE_INSTALL_CHECK_TIMEOUT_MS,
+	REMOTE_INSTALL_CHECK_WORK_TIMEOUT_MS,
+	REMOTE_INSTALL_LOCK_HARD_STALE_MS,
 	REMOTE_INSTALL_LOCK_WAIT_MS,
 	readWorkspaceLocalState,
 	remoteCommands,
 	requireValidRemotePath,
 	SSH_EXEC_TIMEOUT_MS,
+	SshCommandSignalError,
+	SshCommandTimeoutError,
 	serverSocketPath,
 	sshExec,
 	waitForWorkspaceGeneration,
+	waitForWorkspaceSocketRemoval,
 	workspaceSshRemoteCommand,
 	writeWorkspaceLocalState,
 } from "../src/experimental/workspace.ts";
@@ -94,25 +101,31 @@ function shellTestPath(): string {
 }
 
 function hasGeneratedShellTools(): boolean {
-	return ["stat", "find", "tar", "mv", "sha256sum"].every((tool) => {
-		const result = spawnSync(tool, ["--version"], {
-			env: { ...process.env, PATH: shellTestPath() },
-			encoding: "utf8",
-		});
-		return result.status === 0 && /GNU|coreutils/iu.test(`${result.stdout}${result.stderr}`);
-	});
+	return (
+		process.platform === "linux" &&
+		["stat", "find", "tar", "mv", "sha256sum"].every((tool) => {
+			const result = spawnSync(tool, ["--version"], {
+				env: { ...process.env, PATH: shellTestPath() },
+				encoding: "utf8",
+			});
+			return result.status === 0 && /GNU|coreutils/iu.test(`${result.stdout}${result.stderr}`);
+		})
+	);
 }
 
 const GENERATED_SHELL_TOOLS_AVAILABLE = hasGeneratedShellTools();
-const GENERATED_SHELL_REQUIREMENTS =
-	process.platform === "darwin"
-		? "requires: brew install coreutils findutils gnu-tar"
-		: "requires GNU coreutils, findutils, and tar";
+const GENERATED_SHELL_REQUIREMENTS = "requires Linux procfs plus GNU coreutils, findutils, and tar";
 const GENERATED_SHELL_TEST_NAME = `executes install transactions under sh and zsh (${GENERATED_SHELL_REQUIREMENTS})`;
 
 function generatedShellTest(name: string, run: () => Promise<void>): void {
-	const selectedTest = GENERATED_SHELL_TOOLS_AVAILABLE ? test : test.skip;
-	selectedTest(name, run, 60_000);
+	if (process.platform === "darwin" && process.env.CI === undefined) {
+		test.skip(`${name}; explicit skip on unsupported local macOS`, run);
+		return;
+	}
+	test(name, async () => {
+		expect(GENERATED_SHELL_TOOLS_AVAILABLE, GENERATED_SHELL_REQUIREMENTS).toBe(true);
+		await run();
+	}, 60_000);
 }
 
 function runGeneratedShell(
@@ -446,6 +459,9 @@ describe("workspace remote paths and command construction", () => {
 		expect(command).toContain(`-name .candidate-\\*`);
 		expect(command).toContain(`-name .lock-recovery-\\*`);
 		expect(command).toContain("while sleep 1; do validate_install_lock_owner");
+		expect(command).toContain("read_process_start_time");
+		expect(command).toContain("/proc/sys/kernel/random/uuid");
+		expect(command).toContain("$piw_lock_pid:$piw_lock_start:$piw_lock_token:$piw_lock_created");
 		expect(command).toContain(`touch -c ${installed.shareRoot}/.install-transaction-lock`);
 		expect(command.indexOf("validate_install_lock_owner")).toBeLessThan(
 			command.indexOf(`touch -c ${installed.shareRoot}/.install-transaction-lock`),
@@ -454,9 +470,12 @@ describe("workspace remote paths and command construction", () => {
 			command.indexOf("acquire_install_lock()"),
 			command.indexOf("& piw_lock_heartbeat=$!"),
 		);
-		expect(lockAcquisition.match(/continue;/gu)).toHaveLength(4);
-		expect(lockAcquisition.match(/retry_install_lock \|\| return 1; continue;/gu)).toHaveLength(4);
+		expect(lockAcquisition.match(/continue;/gu)).toHaveLength(6);
+		expect(lockAcquisition.match(/retry_install_lock \|\| return 1; continue;/gu)).toHaveLength(6);
 		expect(command).toContain("piw_lock_attempt=$((piw_lock_attempt+1)); sleep 1");
+		expect(command).toContain(
+			`timed out waiting for remote install lock ${installed.shareRoot}/.install-transaction-lock`,
+		);
 		expect(command).toContain(`find ${installed.shareRoot}/releases -mindepth 1 -maxdepth 1 -name .repair-\\*`);
 		const candidate = `${installed.shareRoot}/.candidate-${manifestDigest}-${artifactDigest}-$$`;
 		const fallback = `${installed.shareRoot}/releases/.repair-${manifestDigest}-${artifactDigest}-$$`;
@@ -480,11 +499,14 @@ describe("workspace remote paths and command construction", () => {
 		expect(targetActivated).toBeGreaterThan(targetModeVerified);
 	});
 
-	test("orders default SSH, lock wait, install check, and artifact upload timeouts", () => {
-		expect(SSH_EXEC_TIMEOUT_MS).toBeLessThan(REMOTE_INSTALL_LOCK_WAIT_MS);
-		expect(REMOTE_INSTALL_LOCK_WAIT_MS).toBeGreaterThanOrEqual(120_000);
-		expect(REMOTE_INSTALL_LOCK_WAIT_MS).toBeLessThan(REMOTE_INSTALL_CHECK_TIMEOUT_MS);
-		expect(REMOTE_INSTALL_CHECK_TIMEOUT_MS).toBeLessThan(REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS);
+	test("derives lock and command budgets so a healthy installer finishes before its waiter", () => {
+		expect(SSH_EXEC_TIMEOUT_MS).toBeLessThan(REMOTE_ARTIFACT_INSTALL_WORK_TIMEOUT_MS);
+		expect(REMOTE_ARTIFACT_INSTALL_WORK_TIMEOUT_MS).toBeLessThan(REMOTE_INSTALL_LOCK_WAIT_MS);
+		expect(REMOTE_INSTALL_CHECK_TIMEOUT_MS).toBe(REMOTE_INSTALL_LOCK_WAIT_MS + REMOTE_INSTALL_CHECK_WORK_TIMEOUT_MS);
+		expect(REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS).toBe(
+			REMOTE_INSTALL_LOCK_WAIT_MS + REMOTE_ARTIFACT_INSTALL_WORK_TIMEOUT_MS,
+		);
+		expect(REMOTE_ARTIFACT_INSTALL_TIMEOUT_MS).toBeLessThan(REMOTE_INSTALL_LOCK_HARD_STALE_MS);
 	});
 
 	test("treats a signal-only generated shell exit as a failure", async () => {
@@ -500,7 +522,58 @@ describe("workspace remote paths and command construction", () => {
 		try {
 			await writeFile(join(fakeBin, "ssh"), "#!/bin/sh\nkill -TERM $$\n", { mode: 0o700 });
 			process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
-			await expect(sshExec("workspace-bcli-10", "true")).rejects.toThrow(/terminated by signal SIGTERM/);
+			await expect(sshExec("workspace-bcli-10", "true")).rejects.toBeInstanceOf(SshCommandSignalError);
+		} finally {
+			process.env.PATH = originalPath;
+			await rm(fakeBin, { recursive: true, force: true });
+		}
+	});
+
+	test("treats a one-shot SSH timeout as a typed production failure", async () => {
+		const fakeBin = await mkdtemp(join(tmpdir(), "pi-workspace-ssh-timeout-"));
+		const originalPath = process.env.PATH;
+		try {
+			await writeFile(join(fakeBin, "ssh"), "#!/bin/sh\nexec sleep 60\n", { mode: 0o700 });
+			process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
+			await expect(sshExec("workspace-bcli-10", "true", { timeoutMs: 10 })).rejects.toBeInstanceOf(
+				SshCommandTimeoutError,
+			);
+		} finally {
+			process.env.PATH = originalPath;
+			await rm(fakeBin, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a direct install cleanly when SSH closes archive stdin", async () => {
+		const fakeBin = await mkdtemp(join(tmpdir(), "pi-workspace-ssh-stdin-"));
+		const counter = join(fakeBin, "counter");
+		const originalPath = process.env.PATH;
+		try {
+			await writeFile(
+				join(fakeBin, "ssh"),
+				`#!/bin/sh\ncount=$(cat ${counter} 2>/dev/null || printf 0)\ncount=$((count+1))\nprintf %s "$count" > ${counter}\nif [ "$count" = 1 ]; then exit 1; fi\nexec 0<&-\nsleep 1\nexit 17\n`,
+				{ mode: 0o700 },
+			);
+			process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
+			const archive = Buffer.alloc(32 * 1024 * 1024);
+			const artifact = {
+				role: "server" as const,
+				platform: "linux-x64",
+				file: "server.tar.gz",
+				sha256: createHash("sha256").update(archive).digest("hex"),
+				size: archive.length,
+				entrypoint: "bin/pi-workspace-server",
+			};
+			const bundle = {
+				manifest: { schemaVersion: 1 as const, revision: REVISION, protocolVersion: 1, artifacts: [artifact] },
+				manifestSha256: "b".repeat(64),
+				artifact,
+				archive,
+			};
+			const installed = buildInstalledWorkspaceRemotePaths(HOME, REVISION, bundle.manifestSha256, artifact.sha256);
+			await expect(installRemoteWorkspaceArtifact("workspace-bcli-10", installed, bundle)).rejects.toThrow(
+				/Remote Workspace backend install rejected archive input.*EPIPE/,
+			);
 		} finally {
 			process.env.PATH = originalPath;
 			await rm(fakeBin, { recursive: true, force: true });
@@ -577,9 +650,33 @@ describe("workspace remote paths and command construction", () => {
 					expect(unsafeLockResult.stderr).toContain("unsafe remote install lock");
 					await rm(lock);
 					await mkdir(lock, { mode: 0o700 });
-					await writeFile(join(lock, "owner"), "999999999", "utf8");
+					await writeFile(join(lock, "owner"), "999999999:1:dead-owner-token:1", "utf8");
 					await utimes(lock, new Date(0), new Date(0));
 					expect(await runGeneratedShell(shell, reuse)).toMatchObject({ code: 0 });
+
+					const unrelated = spawn("sleep", ["60"], { stdio: "ignore" });
+					try {
+						if (unrelated.pid === undefined) throw new Error("sleep process has no pid");
+						const processStat = await readFile(`/proc/${unrelated.pid}/stat`, "utf8");
+						const processFields = processStat.slice(processStat.lastIndexOf(") ") + 2).split(" ");
+						const processStart = processFields[19];
+						if (processStart === undefined) throw new Error("sleep process has no proc start time");
+
+						await mkdir(lock, { mode: 0o700 });
+						await writeFile(
+							join(lock, "owner"),
+							`${unrelated.pid}:${processStart}0:reused-pid-token:${Math.floor(Date.now() / 1_000)}`,
+							"utf8",
+						);
+						await utimes(lock, new Date(0), new Date(0));
+						expect(await runGeneratedShell(shell, reuse)).toMatchObject({ code: 0 });
+
+						await mkdir(lock, { mode: 0o700 });
+						await writeFile(join(lock, "owner"), `${unrelated.pid}:${processStart}:hard-ceiling-token:1`, "utf8");
+						expect(await runGeneratedShell(shell, reuse)).toMatchObject({ code: 0 });
+					} finally {
+						unrelated.kill("SIGKILL");
+					}
 
 					await writeFile(installed.cliEntry, "corrupt", "utf8");
 					const faultBin = join(home, "fault-bin");
@@ -671,6 +768,68 @@ describe("workspace exact generation readiness", () => {
 			}),
 		).rejects.toThrow(/exact Workspace server generation/);
 		expect(probes).toBe(0);
+	});
+
+	test("tolerates only typed SSH interruptions while readiness polling remains within its deadline", async () => {
+		let clock = 0;
+		let reads = 0;
+		await expect(
+			waitForWorkspaceGeneration(GENERATION, 2_000, {
+				readServerId: async () => {
+					reads += 1;
+					if (reads === 1) throw new SshCommandTimeoutError("workspace-bcli-10", 30_000);
+					if (reads === 2) throw new SshCommandSignalError("workspace-bcli-10", "SIGTERM");
+					return SERVER_ID;
+				},
+				readGeneration: async () => GENERATION,
+				hasSocket: async () => true,
+				probe: async () => true,
+				now: () => clock,
+				sleep: async (delayMs) => {
+					clock += delayMs;
+				},
+			}),
+		).resolves.toBe(SERVER_ID);
+		expect(reads).toBe(3);
+
+		await expect(
+			waitForWorkspaceGeneration(GENERATION, 2_000, {
+				readServerId: async () => {
+					throw new Error("invalid identity");
+				},
+				readGeneration: async () => GENERATION,
+				hasSocket: async () => true,
+				probe: async () => true,
+			}),
+		).rejects.toThrow("invalid identity");
+	});
+
+	test("tolerates typed SSH interruptions only in bounded stop polling", async () => {
+		let clock = 0;
+		let checks = 0;
+		await expect(
+			waitForWorkspaceSocketRemoval(2_000, {
+				hasSocket: async () => {
+					checks += 1;
+					if (checks === 1) throw new SshCommandTimeoutError("workspace-bcli-10", 30_000);
+					if (checks === 2) throw new SshCommandSignalError("workspace-bcli-10", "SIGKILL");
+					return false;
+				},
+				now: () => clock,
+				sleep: async (delayMs) => {
+					clock += delayMs;
+				},
+			}),
+		).resolves.toBe(true);
+		expect(checks).toBe(3);
+
+		await expect(
+			waitForWorkspaceSocketRemoval(2_000, {
+				hasSocket: async () => {
+					throw new Error("invalid socket response");
+				},
+			}),
+		).rejects.toThrow("invalid socket response");
 	});
 });
 
