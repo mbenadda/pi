@@ -340,7 +340,7 @@ export const remoteCommands = {
 			` && if ! mv -T ${candidate} ${target} || ! (${validateDirectory(target)}); then` +
 			` ${restore}; exit 1; fi` +
 			` && if ! (${activate(releaseName, next)}); then ${restore}; exit 1; fi` +
-			` && rm -rf ${fallback}; fi` +
+			` && rm -rf ${fallback}; fi;` +
 			` else mv -T ${temporary} ${target} && ${activate(releaseName, next)}; fi` +
 			` && test -x ${entrypoint}`
 		);
