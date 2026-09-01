@@ -308,6 +308,8 @@ describe("workspace remote paths and command construction", () => {
 		expect(reuseActivated).toBeGreaterThan(reuseModeVerified);
 		expect(reuse).toContain(`test -x ${installed.revisionDir}/bin/esbuild`);
 		expect(reuse).toContain("trap cleanup_workspace_reuse EXIT HUP INT TERM");
+		expect(reuse).not.toMatch(/\bstatus=/u);
+		expect(command).not.toMatch(/\bstatus=/u);
 		expect(command).toContain(
 			`sha256sum ${installed.shareRoot}/.install-${manifestDigest}-${artifactDigest}-$$.tar.gz`,
 		);

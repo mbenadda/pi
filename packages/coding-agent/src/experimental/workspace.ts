@@ -308,8 +308,8 @@ export const remoteCommands = {
 			` && test "$(stat -c %u ${lock})" = "$(id -u)" && chmod 600 ${lock}` +
 			` && command -v flock >/dev/null && exec 9>> ${lock} && flock -w 120 9` +
 			` && ${prune}` +
-			` && cleanup_workspace_reuse() { status=$?; prune_install_scratch || status=1; rm -f ${next};` +
-			` flock -u 9; exec 9>&-; trap - EXIT HUP INT TERM; exit "$status"; }` +
+			` && cleanup_workspace_reuse() { reuse_status=$?; prune_install_scratch || reuse_status=1; rm -f ${next};` +
+			` flock -u 9; exec 9>&-; trap - EXIT HUP INT TERM; exit "$reuse_status"; }` +
 			` && trap cleanup_workspace_reuse EXIT HUP INT TERM && prune_install_scratch` +
 			` && ${ownedDirectory(releaseDir)} && test -x ${entrypoint} && test -x ${esbuild}` +
 			` && test "$(cat ${marker})" = ${releaseName}` +
@@ -368,9 +368,9 @@ export const remoteCommands = {
 			` && test "$(stat -c %u "$scratch")" = "$(id -u)" || return 1;` +
 			` rm -rf "$scratch" || return 1; done; }`;
 		const cleanup =
-			`cleanup_workspace_install() { status=$?; prune_install_scratch || status=1;` +
+			`cleanup_workspace_install() { install_status=$?; prune_install_scratch || install_status=1;` +
 			` rm -rf ${temporary} ${archive} ${next} ${rollbackNext};` +
-			` flock -u 9; exec 9>&-; trap - EXIT HUP INT TERM; exit "$status"; }`;
+			` flock -u 9; exec 9>&-; trap - EXIT HUP INT TERM; exit "$install_status"; }`;
 		return (
 			`${ownedDirectory(shareRoot)} && ${ownedDirectory(releases)} && ${ownedDirectory(quarantineRoot)}` +
 			` && if [ -e ${lock} ] || [ -L ${lock} ]; then` +
