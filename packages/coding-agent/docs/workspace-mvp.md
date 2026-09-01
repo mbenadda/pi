@@ -13,7 +13,7 @@ piw stop bcli-10
 piw update bcli-10
 ```
 
-A Workspace name must contain lowercase letters, digits, and interior hyphens. `bcli-10` resolves to the OpenSSH alias `workspace-bcli-10`. The default cwd is the absolute, shell-safe value of remote `$DATADOG_ROOT`; `--cwd` overrides it. Diagnostic overrides remain available as `--ssh-host`, `--remote-cwd`, `--session-id`, and repeatable `--plugin`.
+A Workspace name must contain lowercase letters, digits, and interior hyphens. `bcli-10` resolves to the OpenSSH alias `workspace-bcli-10`. The default cwd is `$DATADOG_ROOT/dd-source` when that directory exists, otherwise the absolute, shell-safe `$DATADOG_ROOT`; `--cwd` overrides it. Status, stop, and update do not require `DATADOG_ROOT`. Diagnostic overrides remain available as `--ssh-host`, `--remote-cwd`, `--session-id`, and repeatable `--plugin`.
 
 The first launch or `update` streams the backend bundled with that exact `piw` client. It does not require a Pi checkout, Node, npm, or a source build on the Workspace. Authentication and model configuration remain Workspace-side.
 
@@ -25,19 +25,27 @@ The laptop installation is separate from global `pi`:
 
 ```text
 ~/.local/bin/piw
-~/.local/share/pi-workspace/releases/<client-artifact-sha256>/
-~/.local/share/pi-workspace/current -> releases/<client-artifact-sha256>
+~/.local/share/pi-workspace/releases/<manifest-sha256>-<client-artifact-sha256>/
+~/.local/share/pi-workspace/current -> releases/<manifest-sha256>-<client-artifact-sha256>
 ```
 
 The backend is separate from the Workspace's global Pi and managed tasks:
 
 ```text
-~/.local/share/pi-workspace-server/releases/<server-artifact-sha256>/
-~/.local/share/pi-workspace-server/current -> releases/<server-artifact-sha256>
+~/.local/share/pi-workspace-server/releases/<manifest-sha256>-<server-artifact-sha256>/
+~/.local/share/pi-workspace-server/current -> releases/<manifest-sha256>-<server-artifact-sha256>
 ~/.local/state/pi-workspace-server/
 ```
 
-Directories and executables are mode `0700`; metadata and plugin source are `0600`. Installation extracts into a private temporary directory, verifies the immutable manifest, protocol version, artifact size, SHA-256, tar header checksum, entry types, and normalized paths, renames the content-addressed release, then atomically replaces `current`. Links, traversal, absolute archive paths, corrupt archives, and receipt mismatches fail before activation. Existing releases remain rollbackable.
+Install the laptop client from a downloaded release directory with an independently obtained manifest digest:
+
+```bash
+node scripts/install-workspace-release.mjs \
+  --manifest /path/to/release/manifest.json \
+  --manifest-sha256 <digest-pinned-in-release-metadata>
+```
+
+The digest is mandatory and must not be derived from the downloaded manifest or its adjacent checksum file. Directories and executables are mode `0700`; metadata and plugin source are `0600`. Installation extracts into a private temporary directory, verifies the immutable manifest, embedded artifact revision/protocol/role identity, artifact size, SHA-256, tar header checksum, entry types, normalized paths, and every reused file, renames the manifest-and-content-addressed release, then atomically replaces `current`. Partial or changed releases move to `quarantine` and are repaired before activation. Links, traversal, absolute archive paths, corrupt archives, and receipt mismatches fail before activation. Existing valid releases remain rollbackable.
 
 ## Artifact contract
 
@@ -50,7 +58,7 @@ pi-workspace-client-<platform>-<revision>.tar.gz
 pi-workspace-server-<platform>-<revision>.tar.gz
 ```
 
-`manifest.json` has schema version 1, the exact 40-character Git revision, Pi protocol version, and one immutable record per role/platform containing file name, byte size, SHA-256, and entrypoint. A client archive contains `bin/piw`, normal standalone TUI assets, host facet modules, the server-only manifest and checksum, and every supported backend archive. A server archive contains `bin/pi-workspace-server`, a pinned platform `bin/esbuild`, the example split-plugin package, and its exact host facet modules.
+`manifest.json` has schema version 1, the exact 40-character Git revision, Pi protocol version, and one immutable record per role/platform containing file name, byte size, SHA-256, and entrypoint. Each archive independently embeds that revision, protocol, role, platform, and entrypoint; the client identity also pins the bundled server-only manifest digest. A client archive contains `bin/piw`, normal standalone TUI assets, host facet modules, the server-only manifest and checksum, and every supported backend archive. A server archive contains `bin/pi-workspace-server`, a pinned platform `bin/esbuild`, the example split-plugin package, and its exact host facet modules.
 
 Example local build for an Apple Silicon laptop and Linux ARM64 Workspace:
 

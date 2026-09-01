@@ -1,5 +1,6 @@
 import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { buildSshSpawnArgs } from "@earendil-works/pi-client/ssh";
 import { describe, expect, test } from "vitest";
 import { cli } from "../src/cli/experimental/cli.ts";
 import {
@@ -10,6 +11,7 @@ import {
 	requireValidRemotePath,
 	serverSocketPath,
 	waitForWorkspaceGeneration,
+	workspaceSshRemoteCommand,
 	writeWorkspaceLocalState,
 } from "../src/experimental/workspace.ts";
 
@@ -160,15 +162,51 @@ describe("workspace remote paths and command construction", () => {
 	});
 
 	test("builds content-addressed standalone backend paths", () => {
-		const digest = "a".repeat(64);
-		expect(buildInstalledWorkspaceRemotePaths(HOME, REVISION, digest)).toMatchObject({
+		const manifestDigest = "b".repeat(64);
+		const artifactDigest = "a".repeat(64);
+		const release = `${manifestDigest}-${artifactDigest}`;
+		expect(buildInstalledWorkspaceRemotePaths(HOME, REVISION, manifestDigest, artifactDigest)).toMatchObject({
 			shareRoot: `${HOME}/.local/share/pi-workspace-server`,
 			stateRoot: `${HOME}/.local/state/pi-workspace-server`,
-			revisionDir: `${HOME}/.local/share/pi-workspace-server/releases/${digest}`,
-			bridgePath: `${HOME}/.local/share/pi-workspace-server/releases/${digest}/bin/pi-workspace-server`,
-			cliEntry: `${HOME}/.local/share/pi-workspace-server/releases/${digest}/bin/pi-workspace-server`,
+			revisionDir: `${HOME}/.local/share/pi-workspace-server/releases/${release}`,
+			bridgePath: `${HOME}/.local/share/pi-workspace-server/releases/${release}/bin/pi-workspace-server`,
+			cliEntry: `${HOME}/.local/share/pi-workspace-server/releases/${release}/bin/pi-workspace-server`,
 			standalone: true,
 		});
+	});
+
+	test("builds the actual source and standalone SSH bridge argv", () => {
+		const source = paths();
+		const toolchain = {
+			home: HOME,
+			nodePath: `${HOME}/.volta/bin/node`,
+			npmPath: `${HOME}/.volta/bin/npm`,
+			nodeVersion: "v22.23.2",
+		};
+		const socket = serverSocketPath(source, SERVER_ID);
+		expect(workspaceSshRemoteCommand(source, toolchain, socket)).toEqual([
+			toolchain.nodePath,
+			source.bridgePath,
+			socket,
+		]);
+		const standalone = buildInstalledWorkspaceRemotePaths(HOME, REVISION, "b".repeat(64), "a".repeat(64));
+		const standaloneCommand = workspaceSshRemoteCommand(
+			standalone,
+			{ ...toolchain, nodePath: "/usr/bin/env" },
+			socket,
+		);
+		expect(standaloneCommand).toEqual([standalone.bridgePath, socket]);
+		expect(buildSshSpawnArgs({ host: "workspace-bcli-10", remoteCommand: standaloneCommand })).toEqual([
+			"ssh",
+			"-o",
+			"BatchMode=yes",
+			"-o",
+			"RequestTTY=no",
+			"-o",
+			"ClearAllForwardings=yes",
+			"workspace-bcli-10",
+			`${standalone.bridgePath} ${socket}`,
+		]);
 	});
 
 	test("derives the coordinator socket from the server identity", () => {
@@ -184,6 +222,12 @@ describe("workspace remote paths and command construction", () => {
 		expect(() => requireValidRemotePath("/a b", "label")).toThrow(/Invalid label/);
 		expect(() => requireValidRemotePath("/../etc", "label")).toThrow(/Invalid label/);
 		expect(() => requireValidRemotePath("/", "label")).toThrow(/Invalid label/);
+	});
+
+	test("prefers the conventional dd-source checkout and safely falls back to DATADOG_ROOT", () => {
+		expect(remoteCommands.probeDefaultCwd).toContain('test -d "$DATADOG_ROOT/dd-source"');
+		expect(remoteCommands.probeDefaultCwd).toContain('printf %s "$DATADOG_ROOT/dd-source"');
+		expect(remoteCommands.probeDefaultCwd).toContain('elif test -d "$DATADOG_ROOT"');
 	});
 
 	test("builds a detached server start command with validated values", () => {
@@ -248,6 +292,19 @@ describe("workspace remote paths and command construction", () => {
 			}),
 		).toThrow(/Invalid plugin package/);
 		expect(() => remoteCommands.writeMarker(paths(), "not-a-revision")).toThrow(/Invalid revision/);
+	});
+
+	test("builds a transfer-verified standalone install without trusting archive paths from the remote tar", () => {
+		const manifestDigest = "b".repeat(64);
+		const artifactDigest = "a".repeat(64);
+		const installed = buildInstalledWorkspaceRemotePaths(HOME, REVISION, manifestDigest, artifactDigest);
+		const command = remoteCommands.installArtifact(installed, artifactDigest);
+		expect(command).toContain(`sha256sum ${installed.shareRoot}/.install-${manifestDigest}-${artifactDigest}.tar.gz`);
+		expect(command).toContain("--no-same-owner --no-same-permissions");
+		expect(command).toContain(".pi-workspace-artifact.json");
+		expect(command).toContain("sha256sum > .tree.sha256");
+		expect(command).toContain(`mv ${installed.revisionDir} ${installed.shareRoot}/quarantine/`);
+		expect(command).toContain(`[ ! -L ${installed.shareRoot}/current ]`);
 	});
 
 	test("builds stop and purge commands that only touch MVP-owned paths", () => {

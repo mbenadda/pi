@@ -22,18 +22,20 @@ if (process.argv.length !== 3 || socketPath === undefined || !SOCKET_PATH_PATTER
 const socket = createConnection(socketPath);
 socket.once("error", (error) => {
 	process.stderr.write(`workspace-ssh-bridge: ${error.message}\n`);
-	process.exit(1);
+	process.exitCode = 1;
 });
 socket.once("connect", () => {
-	// Once both streams are wired, any side closing ends the session orderly.
 	process.stdin.pipe(socket);
 	socket.pipe(process.stdout);
 	process.stdin.resume();
 });
-const finishOrderly = () => {
+process.stdin.once("error", (error) => {
+	process.stderr.write(`workspace-ssh-bridge: stdin: ${error.message}\n`);
+	process.exitCode = 1;
 	socket.destroy();
-	process.exit(0);
-};
-process.stdin.once("end", finishOrderly);
-process.stdin.once("error", finishOrderly);
-socket.once("close", () => process.exit(0));
+});
+process.stdout.once("error", (error) => {
+	process.stderr.write(`workspace-ssh-bridge: stdout: ${error.message}\n`);
+	process.exitCode = 1;
+	socket.destroy();
+});

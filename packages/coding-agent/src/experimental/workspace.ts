@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { Client } from "@earendil-works/pi-client";
 import { createSshTransportFactory, isValidRemoteCommandPart, isValidSshHost } from "@earendil-works/pi-client/ssh";
 import { isServerId } from "@earendil-works/pi-protocol";
@@ -106,15 +106,20 @@ export function buildWorkspaceRemotePaths(home: string, revision: string): Works
 export function buildInstalledWorkspaceRemotePaths(
 	home: string,
 	revision: string,
+	manifestSha256: string,
 	artifactSha256: string,
 ): WorkspaceRemotePaths {
 	if (!REVISION_PATTERN.test(revision)) throw new Error(`Invalid revision: ${JSON.stringify(revision)}`);
+	if (!/^[0-9a-f]{64}$/u.test(manifestSha256)) {
+		throw new Error(`Invalid manifest checksum: ${JSON.stringify(manifestSha256)}`);
+	}
 	if (!/^[0-9a-f]{64}$/u.test(artifactSha256)) {
 		throw new Error(`Invalid artifact checksum: ${JSON.stringify(artifactSha256)}`);
 	}
 	const shareRoot = `${home}/.local/share/pi-workspace-server`;
 	const stateRoot = `${home}/.local/state/pi-workspace-server`;
-	const revisionDir = `${shareRoot}/releases/${artifactSha256}`;
+	const releaseName = `${manifestSha256}-${artifactSha256}`;
+	const revisionDir = `${shareRoot}/releases/${releaseName}`;
 	const serverDir = `${stateRoot}/server`;
 	return {
 		revision,
@@ -228,7 +233,8 @@ export function resolveLocalRepository(): LocalRepository {
 /** Remote command builders. Exported for tests: every interpolated value is path/host validated. */
 export const remoteCommands = {
 	probeHome: 'printf %s "$HOME"',
-	probeDatadogRoot: 'test -n "$DATADOG_ROOT" && printf %s "$DATADOG_ROOT"',
+	probeDefaultCwd:
+		'if test -n "$DATADOG_ROOT"; then if test -d "$DATADOG_ROOT/dd-source"; then printf %s "$DATADOG_ROOT/dd-source"; elif test -d "$DATADOG_ROOT"; then printf %s "$DATADOG_ROOT"; else exit 1; fi; else exit 1; fi',
 	probePlatform:
 		'case "$(uname -s):$(uname -m)" in Linux:x86_64) printf %s linux-x64;; Linux:aarch64|Linux:arm64) printf %s linux-arm64;; *) exit 1;; esac',
 	probeNode(home: string): string {
@@ -252,14 +258,17 @@ export const remoteCommands = {
 	ensureDirectories(paths: WorkspaceRemotePaths): string {
 		const dirs = [
 			paths.shareRoot,
-			...(paths.standalone ? [`${paths.shareRoot}/releases`] : []),
+			...(paths.standalone ? [`${paths.shareRoot}/releases`, `${paths.shareRoot}/quarantine`] : []),
 			paths.stateRoot,
 			paths.serverDir,
 			paths.sessionDir,
 			paths.npmCacheDir,
 		];
 		const validated = dirs.map((path) => requireValidRemotePath(path, "state directory"));
-		return `mkdir -p ${validated.join(" ")} && chmod 700 ${validated.join(" ")}`;
+		return (
+			`mkdir -p ${validated.join(" ")} && chmod 700 ${validated.join(" ")}` +
+			` && for p in ${validated.join(" ")}; do test -d "$p" && test ! -L "$p" || exit 1; done`
+		);
 	},
 	isStaged(paths: WorkspaceRemotePaths): string {
 		return `test -f ${requireValidRemotePath(paths.markerPath, "staging marker")}`;
@@ -269,9 +278,15 @@ export const remoteCommands = {
 		const marker = requireValidRemotePath(paths.markerPath, "install marker");
 		const entrypoint = requireValidRemotePath(paths.cliEntry, "server entrypoint");
 		const shareRoot = requireValidRemotePath(paths.shareRoot, "runtime root");
+		const releaseName = basename(paths.revisionDir);
+		if (!new RegExp(`^[0-9a-f]{64}-${artifactSha256}$`, "u").test(releaseName))
+			throw new Error("Invalid release identity");
 		return (
-			`test -x ${entrypoint} && test "$(cat ${marker})" = ${artifactSha256}` +
-			` && test "$(readlink ${shareRoot}/current)" = releases/${artifactSha256}`
+			`test -x ${entrypoint} && test "$(cat ${marker})" = ${releaseName}` +
+			` && test "$(readlink ${shareRoot}/current)" = releases/${releaseName}` +
+			` && cd ${requireValidRemotePath(paths.revisionDir, "release directory")}` +
+			` && test -z "$(find . ! -type d ! -type f -print -quit)"` +
+			` && find . -type f ! -name .tree.sha256 -print0 | sort -z | xargs -0 sha256sum | cmp - .tree.sha256`
 		);
 	},
 	extractArchive(paths: WorkspaceRemotePaths): string {
@@ -284,17 +299,26 @@ export const remoteCommands = {
 		const shareRoot = requireValidRemotePath(paths.shareRoot, "runtime root");
 		const target = requireValidRemotePath(paths.revisionDir, "release directory");
 		const entrypoint = requireValidRemotePath(paths.cliEntry, "server entrypoint");
-		const marker = requireValidRemotePath(paths.markerPath, "install marker");
-		const temporary = `${shareRoot}/.install-${artifactSha256}`;
-		const next = `${shareRoot}/.current-${artifactSha256}`;
+		const releaseName = basename(paths.revisionDir);
+		if (!new RegExp(`^[0-9a-f]{64}-${artifactSha256}$`, "u").test(releaseName))
+			throw new Error("Invalid release identity");
+		const temporary = `${shareRoot}/.install-${releaseName}`;
+		const archive = `${temporary}.tar.gz`;
+		const next = `${shareRoot}/.current-${releaseName}`;
+		const quarantine = `${shareRoot}/quarantine/${releaseName}-$$`;
 		return (
-			`rm -rf ${temporary} ${next} && mkdir -p ${temporary} && chmod 700 ${temporary}` +
-			` && tar -xz -C ${temporary} && test -x ${temporary}/bin/pi-workspace-server` +
-			` && test -x ${temporary}/bin/esbuild` +
-			` && printf %s ${artifactSha256} > ${temporary}/install.json && chmod 600 ${temporary}/install.json` +
-			` && if [ -d ${target} ]; then test "$(cat ${marker})" = ${artifactSha256} && rm -rf ${temporary};` +
-			` else mv ${temporary} ${target}; fi` +
-			` && test -x ${entrypoint} && ln -s releases/${artifactSha256} ${next}` +
+			`rm -rf ${temporary} ${archive} ${next} && cat > ${archive}` +
+			` && test "$(sha256sum ${archive} | cut -d " " -f 1)" = ${artifactSha256}` +
+			` && mkdir ${temporary} && chmod 700 ${temporary}` +
+			` && tar -xzf ${archive} -C ${temporary} --no-same-owner --no-same-permissions && rm -f ${archive}` +
+			` && test -x ${temporary}/bin/pi-workspace-server && test -x ${temporary}/bin/esbuild` +
+			` && test -f ${temporary}/.pi-workspace-artifact.json` +
+			` && printf %s ${releaseName} > ${temporary}/install.json && chmod 600 ${temporary}/install.json` +
+			` && cd ${temporary} && find . -type f ! -name .tree.sha256 -print0 | sort -z | xargs -0 sha256sum > .tree.sha256` +
+			` && chmod 600 .tree.sha256 && cd ${shareRoot}` +
+			` && if [ -e ${shareRoot}/current ] && [ ! -L ${shareRoot}/current ]; then exit 1; fi` +
+			` && if [ -e ${target} ] || [ -L ${target} ]; then mv ${target} ${quarantine}; fi && mv ${temporary} ${target}` +
+			` && test -x ${entrypoint} && ln -s releases/${releaseName} ${next}` +
 			` && mv -Tf ${next} ${shareRoot}/current`
 		);
 	},
@@ -495,22 +519,32 @@ export async function installRemoteWorkspaceArtifact(
 	return true;
 }
 
+export function workspaceSshRemoteCommand(
+	paths: WorkspaceRemotePaths,
+	toolchain: WorkspaceRemoteToolchain,
+	socketPath: string,
+): readonly string[] {
+	const socket = requireValidRemotePath(socketPath, "server socket");
+	return paths.standalone
+		? [requireValidRemotePath(paths.bridgePath, "server bridge"), socket]
+		: [
+				requireValidRemotePath(toolchain.nodePath, "node path"),
+				requireValidRemotePath(paths.bridgePath, "server bridge"),
+				socket,
+			];
+}
+
 /** Connects one protocol client over the SSH byte bridge; used to probe server liveness. */
 export async function probeRemoteServer(
 	connection: {
 		readonly serverId: string;
-		readonly socketPath: string;
-		readonly bridgePath: string;
-		readonly nodePath: string;
+		readonly remoteCommand: readonly string[];
 	},
 	host: string,
 ): Promise<boolean> {
 	const client = new Client({
 		serverId: requireValidServerId(connection.serverId),
-		transportFactory: createSshTransportFactory({
-			host,
-			remoteCommand: [connection.nodePath, connection.bridgePath, connection.socketPath],
-		}),
+		transportFactory: createSshTransportFactory({ host, remoteCommand: connection.remoteCommand }),
 	});
 	try {
 		await client.connect();
@@ -669,33 +703,34 @@ async function ensureRemoteServer(
 	pluginPackages: readonly string[],
 ): Promise<string> {
 	const existing = await readRemoteServerId(host, paths);
-	if (existing !== undefined) {
-		const socketPath = serverSocketPath(paths, existing);
-		const socket = await sshExec(host, remoteCommands.hasSocket(socketPath));
+	const existingSocketPath = existing === undefined ? undefined : serverSocketPath(paths, existing);
+	if (existing !== undefined && existingSocketPath !== undefined) {
+		const socket = await sshExec(host, remoteCommands.hasSocket(existingSocketPath));
 		const runningGeneration = await readRemoteServerGeneration(host, paths);
 		if (
 			runningGeneration !== undefined &&
 			socket.code === 0 &&
 			(await probeRemoteServer(
-				{ serverId: existing, socketPath, bridgePath: paths.bridgePath, nodePath: toolchain.nodePath },
+				{ serverId: existing, remoteCommand: workspaceSshRemoteCommand(paths, toolchain, existingSocketPath) },
 				host,
 			))
 		) {
 			return existing;
 		}
-		if (runningGeneration === undefined) {
-			console.log(`Replacing stale Workspace server with revision ${paths.revision}…`);
-			const stopped = await sshExec(host, remoteCommands.stopServer(paths));
-			if (!stopped.stdout.includes("stopped") && !stopped.stdout.includes("absent")) {
-				throw new Error("Refused to stop the previous Pi Workspace server revision");
-			}
-			if (stopped.stdout.includes("stopped")) {
-				const deadline = Date.now() + SERVER_STOP_TIMEOUT_MS;
-				while (Date.now() < deadline) {
-					if ((await sshExec(host, remoteCommands.hasSocket(socketPath))).code !== 0) break;
-					await new Promise<void>((resolve) => setTimeout(resolve, POLL_MS));
-				}
-			}
+	}
+	const stopped = await sshExec(host, remoteCommands.stopServer(paths));
+	if (!stopped.stdout.includes("stopped") && !stopped.stdout.includes("absent")) {
+		throw new Error("Refused to stop the unreachable or stale Pi Workspace server generation");
+	}
+	if (stopped.stdout.includes("stopped") && existingSocketPath !== undefined) {
+		console.log(`Replacing unreachable or stale Workspace server with revision ${paths.revision}…`);
+		const deadline = Date.now() + SERVER_STOP_TIMEOUT_MS;
+		while (Date.now() < deadline) {
+			if ((await sshExec(host, remoteCommands.hasSocket(existingSocketPath))).code !== 0) break;
+			await new Promise<void>((resolve) => setTimeout(resolve, POLL_MS));
+		}
+		if ((await sshExec(host, remoteCommands.hasSocket(existingSocketPath))).code === 0) {
+			throw new Error("Timed out stopping the unreachable or stale Pi Workspace server generation");
 		}
 	}
 	console.log("Starting the persistent Workspace server…");
@@ -711,9 +746,7 @@ async function ensureRemoteServer(
 				probeRemoteServer(
 					{
 						serverId,
-						socketPath: serverSocketPath(paths, serverId),
-						bridgePath: paths.bridgePath,
-						nodePath: toolchain.nodePath,
+						remoteCommand: workspaceSshRemoteCommand(paths, toolchain, serverSocketPath(paths, serverId)),
 					},
 					host,
 				),
@@ -765,7 +798,12 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 		const home = requireValidRemotePath(homeResult.stdout, "remote home");
 		bundle = await readBundledWorkspaceServer(platformResult.stdout.trim(), bundledRoot);
 		if (bundle === undefined) throw new Error("Installed piw has no bundled Workspace server artifact");
-		paths = buildInstalledWorkspaceRemotePaths(home, bundle.manifest.revision, bundle.artifact.sha256);
+		paths = buildInstalledWorkspaceRemotePaths(
+			home,
+			bundle.manifest.revision,
+			bundle.manifestSha256,
+			bundle.artifact.sha256,
+		);
 		toolchain = {
 			home,
 			nodePath: "/usr/bin/env",
@@ -773,27 +811,22 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 			nodeVersion: `standalone ${bundle.manifest.revision}`,
 		};
 	}
-	let remoteCwd: string;
-	if (command.remoteCwd === undefined) {
-		const inferred = await sshExec(host, remoteCommands.probeDatadogRoot);
-		if (inferred.code !== 0 || inferred.stdout.length === 0) {
-			throw new Error("Remote DATADOG_ROOT is unset; pass --cwd with an absolute remote path");
-		}
-		remoteCwd = requireValidRemotePath(inferred.stdout, "remote DATADOG_ROOT");
-	} else {
-		remoteCwd = requireValidRemotePath(command.remoteCwd, "remote working directory");
-	}
-	const directories = await sshExec(host, remoteCommands.ensureDirectories(paths));
-	if (directories.code !== 0) throw new Error("Failed to create private Pi Workspace state directories");
-
 	if (command.status === true) {
-		await reportWorkspaceStatus(host, remoteCwd, paths.revision, paths, toolchain);
+		await reportWorkspaceStatus(
+			host,
+			await resolveRemoteCwd(host, command.remoteCwd, false),
+			paths.revision,
+			paths,
+			toolchain,
+		);
 		return;
 	}
 	if (command.cleanup === true || command.purge === true) {
 		await cleanupWorkspace(host, paths, command.purge === true);
 		return;
 	}
+	const directories = await sshExec(host, remoteCommands.ensureDirectories(paths));
+	if (directories.code !== 0) throw new Error("Failed to create private Pi Workspace state directories");
 	if (bundle === undefined) {
 		if (repository === undefined) throw new Error("Workspace source staging has no local repository");
 		await stageRemoteRevision(host, paths, toolchain, repository);
@@ -804,6 +837,8 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 			return;
 		}
 	}
+	const remoteCwd = await resolveRemoteCwd(host, command.remoteCwd, true);
+	if (remoteCwd === undefined) throw new Error("Remote working directory resolution failed");
 	const serverId = await ensureRemoteServer(
 		host,
 		paths,
@@ -824,21 +859,36 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 			path: serverSocketPath(paths, serverId),
 			bridgePath: paths.bridgePath,
 			nodePath: toolchain.nodePath,
+			remoteCommand: workspaceSshRemoteCommand(paths, toolchain, serverSocketPath(paths, serverId)),
 		},
 		sessionId,
 	});
 }
 
+async function resolveRemoteCwd(
+	host: string,
+	configured: string | undefined,
+	required: boolean,
+): Promise<string | undefined> {
+	if (configured !== undefined) return requireValidRemotePath(configured, "remote working directory");
+	const inferred = await sshExec(host, remoteCommands.probeDefaultCwd);
+	if (inferred.code === 0 && inferred.stdout.length > 0) {
+		return requireValidRemotePath(inferred.stdout, "remote default working directory");
+	}
+	if (required) throw new Error("Remote DATADOG_ROOT is unset or invalid; pass --cwd with an absolute remote path");
+	return undefined;
+}
+
 async function reportWorkspaceStatus(
 	host: string,
-	remoteCwd: string,
+	remoteCwd: string | undefined,
 	revision: string,
 	paths: WorkspaceRemotePaths,
 	toolchain: WorkspaceRemoteToolchain,
 ): Promise<void> {
 	const staged = await sshExec(host, remoteCommands.isStaged(paths));
 	console.log(`Host:            ${host}`);
-	console.log(`Remote cwd:      ${remoteCwd}`);
+	console.log(`Remote cwd:      ${remoteCwd ?? "not selected"}`);
 	console.log(`Revision:        ${revision} (${staged.code === 0 ? "installed" : "not installed"})`);
 	console.log(`Remote runtime:  ${toolchain.nodeVersion} (${paths.standalone ? paths.cliEntry : toolchain.nodePath})`);
 	console.log(`State root:      ${paths.stateRoot}`);
@@ -852,7 +902,7 @@ async function reportWorkspaceStatus(
 		const alive =
 			socket.code === 0 &&
 			(await probeRemoteServer(
-				{ serverId, socketPath, bridgePath: paths.bridgePath, nodePath: toolchain.nodePath },
+				{ serverId, remoteCommand: workspaceSshRemoteCommand(paths, toolchain, socketPath) },
 				host,
 			));
 		const runningGeneration = await readRemoteServerGeneration(host, paths);
@@ -860,7 +910,7 @@ async function reportWorkspaceStatus(
 			`Server:          ${serverId} (${alive ? "reachable" : "stopped"}; generation ${runningGeneration ?? "unknown"})`,
 		);
 	}
-	const state = await readWorkspaceLocalState(host, remoteCwd);
+	const state = remoteCwd === undefined ? undefined : await readWorkspaceLocalState(host, remoteCwd);
 	console.log(`Local session:   ${state === undefined ? "none" : state.sessionId}`);
 }
 

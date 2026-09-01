@@ -37,6 +37,35 @@ describe("Workspace semantic SSH bridge", () => {
 		await bridge;
 	});
 
+	test("drains the socket response after input EOF", async () => {
+		const directory = await mkdtemp("/tmp/pi-workspace-bridge-");
+		const path = join(directory, "server.sock");
+		const server = createServer({ allowHalfOpen: true }, (socket) => {
+			const chunks: Buffer[] = [];
+			socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+			socket.on("end", () => {
+				socket.end(Buffer.concat([Buffer.from("complete:"), ...chunks]));
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(path, resolve);
+		});
+		cleanups.push(async () => {
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			await rm(directory, { recursive: true, force: true });
+		});
+
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const chunks: Buffer[] = [];
+		output.on("data", (chunk: Buffer) => chunks.push(chunk));
+		const bridge = runWorkspaceSshBridge([path], { input, output });
+		input.end("request");
+		await bridge;
+		expect(Buffer.concat(chunks).toString("utf8")).toBe("complete:request");
+	});
+
 	test.each([[[]], [["relative.sock"]], [["/tmp/socket", "extra"]], [["/tmp/socket;bad"]]] as const)(
 		"rejects invalid argv %j before connecting",
 		async (args) => {

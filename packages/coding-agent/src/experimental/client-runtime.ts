@@ -87,6 +87,9 @@ export async function openClientRuntime(
 							path: command.connect.path,
 							bridgePath: command.connect.bridgePath,
 							nodePath: command.connect.nodePath,
+							...(command.connect.remoteCommand === undefined
+								? {}
+								: { remoteCommand: command.connect.remoteCommand }),
 						}
 					: { transport: "unix", ...routeFromExplicitPath(command.connect.path) },
 		];
@@ -144,7 +147,7 @@ export async function openClientRuntime(
 								: route.transport === "ssh"
 									? createSshTransportFactory({
 											host: route.host,
-											remoteCommand: [route.nodePath, route.bridgePath, route.path],
+											remoteCommand: route.remoteCommand ?? [route.nodePath, route.bridgePath, route.path],
 										})
 									: createRadiusClientTransportFactory({
 											serverId: route.serverId,

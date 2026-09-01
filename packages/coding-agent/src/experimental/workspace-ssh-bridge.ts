@@ -19,26 +19,34 @@ export async function runWorkspaceSshBridge(
 	}
 	const socket = createConnection(socketPath);
 	await new Promise<void>((resolve, reject) => {
-		let connected = false;
 		let settled = false;
-		const finish = (error?: Error): void => {
-			if (settled) return;
-			settled = true;
+		const cleanup = (): void => {
 			streams.input.unpipe(socket);
 			socket.unpipe(streams.output);
-			socket.destroy();
-			if (error && !connected) reject(error);
-			else resolve();
+			streams.input.off("error", fail);
+			streams.output.off("error", fail);
 		};
-		socket.once("error", finish);
+		const finish = (): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolve();
+		};
+		const fail = (error: Error): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			socket.destroy();
+			reject(error);
+		};
+		socket.once("error", fail);
 		socket.once("connect", () => {
-			connected = true;
 			streams.input.pipe(socket);
 			socket.pipe(streams.output, { end: false });
 			streams.input.resume();
 		});
-		socket.once("close", () => finish());
-		streams.input.once("end", () => finish());
-		streams.input.once("error", (error) => finish(error));
+		socket.once("close", finish);
+		streams.input.once("error", fail);
+		streams.output.once("error", fail);
 	});
 }

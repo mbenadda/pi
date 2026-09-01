@@ -27,6 +27,8 @@ export interface SshTransportAddress {
 	readonly bridgePath: string;
 	/** Absolute remote Node executable path used to run the bridge. */
 	readonly nodePath: string;
+	/** Exact validated remote argv for internally constructed standalone routes. */
+	readonly remoteCommand?: readonly string[];
 }
 
 export type TransportAddress = UnixTransportAddress | RadiusTransportAddress | SshTransportAddress;
