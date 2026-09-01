@@ -207,7 +207,9 @@ export async function sshExec(
 	options: SshExecOptions = {},
 ): Promise<SshExecResult> {
 	const args = buildSshCommand(host, remoteCommand);
-	const child = spawn(args[0]!, args.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
+	const child = spawn(args[0]!, args.slice(1), {
+		stdio: ["ignore", "pipe", "pipe"],
+	});
 	let stdout = "";
 	let stderr = "";
 	child.stdout.setEncoding("utf8");
@@ -231,7 +233,10 @@ export async function sshExec(
 		child.kill("SIGKILL");
 	}, timeoutMs);
 	timer.unref();
-	let outcome: { readonly code: number | null; readonly signal: NodeJS.Signals | null };
+	let outcome: {
+		readonly code: number | null;
+		readonly signal: NodeJS.Signals | null;
+	};
 	try {
 		outcome = await new Promise((resolve, reject) => {
 			child.once("error", reject);
@@ -266,7 +271,9 @@ export function resolveLocalRepository(): LocalRepository {
 	if (root === undefined) {
 		throw new Error("pi workspace requires a Git checkout of Pi to stage the exact revision");
 	}
-	const revisionResult = spawnSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" });
+	const revisionResult = spawnSync("git", ["-C", root, "rev-parse", "HEAD"], {
+		encoding: "utf8",
+	});
 	if (revisionResult.error !== undefined || revisionResult.status !== 0) {
 		throw new Error(`Failed to resolve the local Pi revision in ${root}`);
 	}
@@ -323,37 +330,70 @@ function remoteInstallTransactionShell(shareRoot: string): string {
 		` || { rm -rf ${lock}; return 1; }; break; fi;` +
 		` if ! test -d ${lock} || test -L ${lock}; then` +
 		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then retry_install_lock || return 1; continue; fi;` +
-		` printf 'piw: unsafe remote install lock: ${lock}\\n' >&2; return 1; fi;` +
+		` printf 'piw: unsafe remote install lock path (expected a directory, not a symlink): ${lock}\\n' >&2; return 1; fi;` +
 		` piw_lock_uid=$(stat -c %u ${lock} 2>/dev/null) || {` +
-		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then retry_install_lock || return 1; continue; fi; return 1; };` +
+		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then retry_install_lock || return 1; continue; fi;` +
+		` printf 'piw: unable to inspect remote install lock directory: ${lock}\\n' >&2; return 1; };` +
 		` test "$piw_lock_uid" = "$(id -u)" || { printf 'piw: unsafe remote install lock ownership: ${lock}\\n' >&2; return 1; };` +
-		` if ! test -f ${lock}/owner || test -L ${lock}/owner; then` +
-		` if [ ! -e ${lock}/owner ] && [ ! -L ${lock}/owner ]; then retry_install_lock || return 1; continue; fi;` +
-		` printf 'piw: unsafe remote install lock owner: ${lock}/owner\\n' >&2; return 1; fi;` +
-		` test "$(stat -c %u ${lock}/owner 2>/dev/null)" = "$(id -u)" || return 1;` +
-		` piw_lock_now=$(date +%s) && piw_lock_mtime=$(stat -c %Y ${lock} 2>/dev/null) || {` +
-		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then retry_install_lock || return 1; continue; fi; return 1; };` +
-		` case "$piw_lock_now:$piw_lock_mtime" in *[!0-9:]*|:*) return 1;; esac;` +
-		` piw_existing_owner=$(cat ${lock}/owner 2>/dev/null) && parse_install_lock_owner "$piw_existing_owner" || return 1;` +
-		` piw_existing_pid=$piw_parsed_pid; piw_existing_start=$piw_parsed_start; piw_existing_created=$piw_parsed_created;` +
-		` piw_existing_alive=0; piw_observed_start=$(read_process_start_time "$piw_existing_pid" 2>/dev/null || true);` +
-		` if kill -0 "$piw_existing_pid" 2>/dev/null && [ "$piw_observed_start" = "$piw_existing_start" ]; then piw_existing_alive=1; fi;` +
-		` piw_lock_age=$((piw_lock_now-piw_lock_mtime)); piw_owner_age=$((piw_lock_now-piw_existing_created)); piw_recover_lock=0;` +
-		` if [ "$piw_existing_alive" = 0 ] && [ "$piw_lock_age" -ge ${REMOTE_INSTALL_LOCK_STALE_SECONDS} ]; then piw_recover_lock=1; fi;` +
-		` if [ "$piw_owner_age" -ge ${REMOTE_INSTALL_LOCK_HARD_STALE_SECONDS} ]; then piw_recover_lock=1; fi;` +
+		` piw_lock_now=$(date +%s) && piw_lock_mtime=$(stat -c %Y ${lock} 2>/dev/null)` +
+		` && piw_lock_snapshot=$(stat -c %d:%i:%u:%f:%Y ${lock} 2>/dev/null) || {` +
+		` if [ ! -e ${lock} ] && [ ! -L ${lock} ]; then retry_install_lock || return 1; continue; fi;` +
+		` printf 'piw: unable to snapshot remote install lock directory: ${lock}\\n' >&2; return 1; };` +
+		` case "$piw_lock_now:$piw_lock_mtime" in *[!0-9:]*|:*)` +
+		` printf 'piw: invalid remote install lock timestamps: ${lock}\\n' >&2; return 1;; esac;` +
+		` piw_owner_state=missing; piw_owner_snapshot=; piw_existing_owner=;` +
+		` if [ -e ${lock}/owner ] || [ -L ${lock}/owner ]; then` +
+		` test -f ${lock}/owner && test ! -L ${lock}/owner` +
+		` || { printf 'piw: unsafe remote install lock owner path (expected a regular file, not a symlink): ${lock}/owner\\n' >&2; return 1; };` +
+		` piw_owner_uid=$(stat -c %u ${lock}/owner 2>/dev/null)` +
+		` && piw_owner_snapshot=$(stat -c %d:%i:%u:%f:%s:%Y:%Z ${lock}/owner 2>/dev/null) || {` +
+		` retry_install_lock || return 1; continue; };` +
+		` test "$piw_owner_uid" = "$(id -u)"` +
+		` || { printf 'piw: unsafe remote install lock owner ownership: ${lock}/owner\\n' >&2; return 1; };` +
+		` if piw_existing_owner=$(cat ${lock}/owner 2>/dev/null); then` +
+		` if parse_install_lock_owner "$piw_existing_owner"; then piw_owner_state=valid; else piw_owner_state=legacy; fi;` +
+		` else piw_owner_state=unreadable; fi; fi;` +
+		` validate_observed_install_lock() { piw_observed_lock=$1;` +
+		` test -d "$piw_observed_lock" && test ! -L "$piw_observed_lock"` +
+		` && test "$(stat -c %u "$piw_observed_lock" 2>/dev/null)" = "$(id -u)"` +
+		` && test "$(stat -c %d:%i:%u:%f:%Y "$piw_observed_lock" 2>/dev/null)" = "$piw_lock_snapshot" || return 1;` +
+		` if [ "$piw_owner_state" = missing ]; then` +
+		` test ! -e "$piw_observed_lock/owner" && test ! -L "$piw_observed_lock/owner"; return; fi;` +
+		` test -f "$piw_observed_lock/owner" && test ! -L "$piw_observed_lock/owner"` +
+		` && test "$(stat -c %u "$piw_observed_lock/owner" 2>/dev/null)" = "$(id -u)"` +
+		` && test "$(stat -c %d:%i:%u:%f:%s:%Y:%Z "$piw_observed_lock/owner" 2>/dev/null)" = "$piw_owner_snapshot"` +
+		` || return 1; if [ "$piw_owner_state" = unreadable ]; then` +
+		` ! cat "$piw_observed_lock/owner" >/dev/null 2>&1; else` +
+		` test "$(cat "$piw_observed_lock/owner" 2>/dev/null)" = "$piw_existing_owner"; fi; };` +
+		` piw_lock_age=$((piw_lock_now-piw_lock_mtime)); piw_recover_lock=0; piw_lock_recovery_reason=;` +
+		` case "$piw_owner_state" in missing) piw_lock_recovery_reason=ownerless;;` +
+		` unreadable) piw_lock_recovery_reason=unreadable-owner;; legacy) piw_lock_recovery_reason=legacy-owner-format;;` +
+		` valid) piw_existing_pid=$piw_parsed_pid; piw_existing_start=$piw_parsed_start;` +
+		` piw_existing_created=$piw_parsed_created; piw_existing_alive=0;` +
+		` piw_observed_start=$(read_process_start_time "$piw_existing_pid" 2>/dev/null || true);` +
+		` if kill -0 "$piw_existing_pid" 2>/dev/null && [ "$piw_observed_start" = "$piw_existing_start" ]; then` +
+		` piw_existing_alive=1; fi; piw_owner_age=$((piw_lock_now-piw_existing_created));` +
+		` if [ "$piw_owner_age" -ge ${REMOTE_INSTALL_LOCK_HARD_STALE_SECONDS} ]; then` +
+		` piw_recover_lock=1; piw_lock_recovery_reason=hard-stale-owner;` +
+		` elif [ "$piw_existing_alive" = 0 ]; then piw_lock_recovery_reason=dead-owner; fi;; esac;` +
+		` if [ "$piw_recover_lock" = 0 ] && [ -n "$piw_lock_recovery_reason" ]` +
+		` && [ "$piw_lock_age" -ge ${REMOTE_INSTALL_LOCK_STALE_SECONDS} ]; then piw_recover_lock=1; fi;` +
 		` if [ "$piw_recover_lock" = 1 ]; then` +
-		` test "$(cat ${lock}/owner 2>/dev/null)" = "$piw_existing_owner"` +
-		` && test "$(stat -c %Y ${lock} 2>/dev/null)" = "$piw_lock_mtime" || { retry_install_lock || return 1; continue; };` +
-		` piw_stale_lock=${shareRoot}/.lock-recovery-$$-$piw_lock_attempt;` +
+		` if ! validate_observed_install_lock ${lock}; then retry_install_lock || return 1; continue; fi;` +
+		` piw_recovery_token=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)` +
+		` || { printf 'piw: failed to create remote install lock recovery identity\\n' >&2; return 1; };` +
+		` case "$piw_recovery_token" in ''|*[!0-9a-f-]*) return 1;; esac;` +
+		` piw_stale_lock=${shareRoot}/.lock-recovery-$piw_recovery_token;` +
+		` printf 'piw: recovering stale remote install lock (%s): ${lock}\\n' "$piw_lock_recovery_reason" >&2;` +
 		` if mv -T ${lock} "$piw_stale_lock" 2>/dev/null; then` +
-		` test -d "$piw_stale_lock" && test ! -L "$piw_stale_lock"` +
-		` && test "$(stat -c %u "$piw_stale_lock")" = "$(id -u)"` +
-		` && test -f "$piw_stale_lock/owner" && test ! -L "$piw_stale_lock/owner"` +
-		` && test "$(stat -c %u "$piw_stale_lock/owner")" = "$(id -u)"` +
-		` && test "$(cat "$piw_stale_lock/owner")" = "$piw_existing_owner"` +
-		` && parse_install_lock_owner "$piw_existing_owner"` +
-		` || { printf 'piw: unsafe stale remote install lock\\n' >&2; return 1; };` +
-		` retry_install_lock || return 1; continue; fi; fi;` +
+		` if ! validate_observed_install_lock "$piw_stale_lock"; then` +
+		` printf 'piw: unsafe stale remote install lock after recovery move: %s\\n' "$piw_stale_lock" >&2;` +
+		` if [ -L "$piw_stale_lock" ] || { [ -e "$piw_stale_lock" ] && [ ! -d "$piw_stale_lock" ]; }; then` +
+		` rm -f "$piw_stale_lock" 2>/dev/null || true; fi; return 1; fi;` +
+		` printf 'piw: recovered stale remote install lock (%s): ${lock}\\n' "$piw_lock_recovery_reason" >&2;` +
+		` retry_install_lock || return 1; continue; fi;` +
+		` printf 'piw: remote install lock recovery move raced; retrying: ${lock}\\n' >&2;` +
+		` retry_install_lock || return 1; continue; fi;` +
 		` retry_install_lock || return 1; done;` +
 		` (while sleep 1; do validate_install_lock_owner || exit; touch -c ${lock} 2>/dev/null || exit; done)` +
 		` & piw_lock_heartbeat=$!; };` +
@@ -736,7 +776,9 @@ export async function installRemoteWorkspaceArtifact(
 	if (installed.code === 0) return false;
 	console.log(`Installing Workspace backend ${bundle.manifest.revision} on ${host}…`);
 	const command = buildSshCommand(host, remoteCommands.installArtifact(paths, bundle.artifact.sha256));
-	const child = spawn(command[0]!, command.slice(1), { stdio: ["pipe", "pipe", "pipe"] });
+	const child = spawn(command[0]!, command.slice(1), {
+		stdio: ["pipe", "pipe", "pipe"],
+	});
 	let stderr = "";
 	child.stderr.setEncoding("utf8");
 	child.stderr.on("data", (chunk: string) => {
@@ -746,12 +788,13 @@ export async function installRemoteWorkspaceArtifact(
 	child.stdin.on("error", (error) => {
 		stdinError = error;
 	});
-	const exit = new Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>(
-		(resolve, reject) => {
-			child.once("error", reject);
-			child.once("exit", (code, signal) => resolve({ code, signal }));
-		},
-	);
+	const exit = new Promise<{
+		readonly code: number | null;
+		readonly signal: NodeJS.Signals | null;
+	}>((resolve, reject) => {
+		child.once("error", reject);
+		child.once("exit", (code, signal) => resolve({ code, signal }));
+	});
 	let timedOut = false;
 	const timer = setTimeout(() => {
 		timedOut = true;
@@ -764,7 +807,10 @@ export async function installRemoteWorkspaceArtifact(
 		stdinError = error instanceof Error ? error : new Error(String(error));
 		child.stdin.destroy();
 	}
-	let outcome: { readonly code: number | null; readonly signal: NodeJS.Signals | null };
+	let outcome: {
+		readonly code: number | null;
+		readonly signal: NodeJS.Signals | null;
+	};
 	try {
 		outcome = await exit;
 	} finally {
@@ -816,7 +862,10 @@ export async function probeRemoteServer(
 ): Promise<boolean> {
 	const client = new Client({
 		serverId: requireValidServerId(connection.serverId),
-		transportFactory: createSshTransportFactory({ host, remoteCommand: connection.remoteCommand }),
+		transportFactory: createSshTransportFactory({
+			host,
+			remoteCommand: connection.remoteCommand,
+		}),
 	});
 	try {
 		await client.connect();
@@ -874,7 +923,11 @@ export async function readWorkspaceLocalState(
 	) {
 		return undefined;
 	}
-	return { revision: parsed.revision, serverId: parsed.serverId, sessionId: parsed.sessionId };
+	return {
+		revision: parsed.revision,
+		serverId: parsed.serverId,
+		sessionId: parsed.sessionId,
+	};
 }
 
 export async function writeWorkspaceLocalState(
@@ -886,7 +939,10 @@ export async function writeWorkspaceLocalState(
 	const path = localStatePath(options.root ?? workspaceLocalStateRoot(), host, remoteCwd);
 	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	await chmod(dirname(path), 0o700);
-	await writeFile(path, `${JSON.stringify(state, null, "\t")}\n`, { encoding: "utf8", mode: 0o600 });
+	await writeFile(path, `${JSON.stringify(state, null, "\t")}\n`, {
+		encoding: "utf8",
+		mode: 0o600,
+	});
 }
 
 /** Reads the logical remote server identity if the MVP has created one before. */
@@ -1013,7 +1069,10 @@ async function ensureRemoteServer(
 			runningGeneration !== undefined &&
 			socket.code === 0 &&
 			(await probeRemoteServer(
-				{ serverId: existing, remoteCommand: workspaceSshRemoteCommand(paths, toolchain, existingSocketPath) },
+				{
+					serverId: existing,
+					remoteCommand: workspaceSshRemoteCommand(paths, toolchain, existingSocketPath),
+				},
 				host,
 			))
 		) {
@@ -1145,7 +1204,11 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 		command.pluginPackages ?? defaultPluginPackages(paths),
 	);
 	const sessionId = await resolveSessionId(command, serverId, remoteCwd);
-	await writeWorkspaceLocalState(host, remoteCwd, { revision: paths.revision, serverId, sessionId });
+	await writeWorkspaceLocalState(host, remoteCwd, {
+		revision: paths.revision,
+		serverId,
+		sessionId,
+	});
 
 	console.log(`Workspace ${host}: server ${serverId}, session ${sessionId}`);
 	await runClientTui({
@@ -1200,7 +1263,10 @@ async function reportWorkspaceStatus(
 		const alive =
 			socket.code === 0 &&
 			(await probeRemoteServer(
-				{ serverId, remoteCommand: workspaceSshRemoteCommand(paths, toolchain, socketPath) },
+				{
+					serverId,
+					remoteCommand: workspaceSshRemoteCommand(paths, toolchain, socketPath),
+				},
 				host,
 			));
 		const runningGeneration = await readRemoteServerGeneration(host, paths);

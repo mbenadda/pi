@@ -118,8 +118,8 @@ const GENERATED_SHELL_REQUIREMENTS = "requires Linux procfs plus GNU coreutils, 
 const GENERATED_SHELL_TEST_NAME = `executes install transactions under sh and zsh (${GENERATED_SHELL_REQUIREMENTS})`;
 
 function generatedShellTest(name: string, run: () => Promise<void>): void {
-	if (process.platform === "darwin" && process.env.CI === undefined) {
-		test.skip(`${name}; explicit skip on unsupported local macOS`, run);
+	if (process.platform !== "linux") {
+		test.skip(`${name}; unsupported on ${process.platform}`, run);
 		return;
 	}
 	test(name, async () => {
@@ -324,7 +324,12 @@ describe("workspace remote paths and command construction", () => {
 			socket,
 		);
 		expect(standaloneCommand).toEqual([standalone.bridgePath, socket]);
-		expect(buildSshSpawnArgs({ host: "workspace-bcli-10", remoteCommand: standaloneCommand })).toEqual([
+		expect(
+			buildSshSpawnArgs({
+				host: "workspace-bcli-10",
+				remoteCommand: standaloneCommand,
+			}),
+		).toEqual([
 			"ssh",
 			"-o",
 			"BatchMode=yes",
@@ -462,6 +467,10 @@ describe("workspace remote paths and command construction", () => {
 		expect(command).toContain("read_process_start_time");
 		expect(command).toContain("/proc/sys/kernel/random/uuid");
 		expect(command).toContain("$piw_lock_pid:$piw_lock_start:$piw_lock_token:$piw_lock_created");
+		expect(command).toContain("stat -c %d:%i:%u:%f:%Y");
+		expect(command).toContain("ownerless");
+		expect(command).toContain("unreadable-owner");
+		expect(command).toContain("legacy-owner-format");
 		expect(command).toContain(`touch -c ${installed.shareRoot}/.install-transaction-lock`);
 		expect(command.indexOf("validate_install_lock_owner")).toBeLessThan(
 			command.indexOf(`touch -c ${installed.shareRoot}/.install-transaction-lock`),
@@ -470,8 +479,8 @@ describe("workspace remote paths and command construction", () => {
 			command.indexOf("acquire_install_lock()"),
 			command.indexOf("& piw_lock_heartbeat=$!"),
 		);
-		expect(lockAcquisition.match(/continue;/gu)).toHaveLength(6);
-		expect(lockAcquisition.match(/retry_install_lock \|\| return 1; continue;/gu)).toHaveLength(6);
+		expect(lockAcquisition).toContain("validate_observed_install_lock");
+		expect(lockAcquisition).toContain("unsafe stale remote install lock after recovery move");
 		expect(command).toContain("piw_lock_attempt=$((piw_lock_attempt+1)); sleep 1");
 		expect(command).toContain(
 			`timed out waiting for remote install lock ${installed.shareRoot}/.install-transaction-lock`,
@@ -520,7 +529,9 @@ describe("workspace remote paths and command construction", () => {
 		const fakeBin = await mkdtemp(join(tmpdir(), "pi-workspace-ssh-signal-"));
 		const originalPath = process.env.PATH;
 		try {
-			await writeFile(join(fakeBin, "ssh"), "#!/bin/sh\nkill -TERM $$\n", { mode: 0o700 });
+			await writeFile(join(fakeBin, "ssh"), "#!/bin/sh\nkill -TERM $$\n", {
+				mode: 0o700,
+			});
 			process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
 			await expect(sshExec("workspace-bcli-10", "true")).rejects.toBeInstanceOf(SshCommandSignalError);
 		} finally {
@@ -533,7 +544,9 @@ describe("workspace remote paths and command construction", () => {
 		const fakeBin = await mkdtemp(join(tmpdir(), "pi-workspace-ssh-timeout-"));
 		const originalPath = process.env.PATH;
 		try {
-			await writeFile(join(fakeBin, "ssh"), "#!/bin/sh\nexec sleep 60\n", { mode: 0o700 });
+			await writeFile(join(fakeBin, "ssh"), "#!/bin/sh\nexec sleep 60\n", {
+				mode: 0o700,
+			});
 			process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
 			await expect(sshExec("workspace-bcli-10", "true", { timeoutMs: 10 })).rejects.toBeInstanceOf(
 				SshCommandTimeoutError,
@@ -565,7 +578,12 @@ describe("workspace remote paths and command construction", () => {
 				entrypoint: "bin/pi-workspace-server",
 			};
 			const bundle = {
-				manifest: { schemaVersion: 1 as const, revision: REVISION, protocolVersion: 1, artifacts: [artifact] },
+				manifest: {
+					schemaVersion: 1 as const,
+					revision: REVISION,
+					protocolVersion: 1,
+					artifacts: [artifact],
+				},
 				manifestSha256: "b".repeat(64),
 				artifact,
 				archive,
@@ -591,8 +609,14 @@ describe("workspace remote paths and command construction", () => {
 			try {
 				const installed = buildInstalledWorkspaceRemotePaths(home, REVISION, manifestDigest, artifactDigest);
 				await Promise.all([
-					mkdir(join(installed.shareRoot, "releases"), { recursive: true, mode: 0o700 }),
-					mkdir(join(installed.shareRoot, "quarantine"), { recursive: true, mode: 0o700 }),
+					mkdir(join(installed.shareRoot, "releases"), {
+						recursive: true,
+						mode: 0o700,
+					}),
+					mkdir(join(installed.shareRoot, "quarantine"), {
+						recursive: true,
+						mode: 0o700,
+					}),
 				]);
 				await chmod(installed.shareRoot, 0o700);
 				const install = remoteCommands.installArtifact(installed, artifactDigest);
@@ -649,10 +673,72 @@ describe("workspace remote paths and command construction", () => {
 					expect(unsafeLockResult.code).not.toBe(0);
 					expect(unsafeLockResult.stderr).toContain("unsafe remote install lock");
 					await rm(lock);
+
+					await mkdir(lock, { mode: 0o700 });
+					await utimes(lock, new Date(0), new Date(0));
+					const ownerlessRecovery = await runGeneratedShell(shell, reuse);
+					expect(ownerlessRecovery).toMatchObject({ code: 0 });
+					expect(ownerlessRecovery.stderr).toContain("recovering stale remote install lock (ownerless)");
+					expect(ownerlessRecovery.stderr).toContain("recovered stale remote install lock (ownerless)");
+
+					await mkdir(lock, { mode: 0o700 });
+					await writeFile(join(lock, "owner"), "999999999", "utf8");
+					await utimes(lock, new Date(0), new Date(0));
+					const legacyRecovery = await runGeneratedShell(shell, reuse);
+					expect(legacyRecovery).toMatchObject({ code: 0 });
+					expect(legacyRecovery.stderr).toContain("recovering stale remote install lock (legacy-owner-format)");
+
+					await mkdir(lock, { mode: 0o700 });
+					await writeFile(join(lock, "owner"), "simulated-unreadable-owner", "utf8");
+					await utimes(lock, new Date(0), new Date(0));
+					const unreadableFaultBin = join(home, "unreadable-fault-bin");
+					await mkdir(unreadableFaultBin, { mode: 0o700 });
+					const realCat = spawnSync("sh", ["-c", "command -v cat"], {
+						env: { ...process.env, PATH: shellTestPath() },
+						encoding: "utf8",
+					}).stdout.trim();
+					await writeFile(
+						join(unreadableFaultBin, "cat"),
+						`#!/bin/sh\ncase "$1" in */owner) value=$(${realCat} "$1" 2>/dev/null || true); if [ "$value" = simulated-unreadable-owner ]; then exit 93; fi;; esac\nexec ${realCat} "$@"\n`,
+						{ mode: 0o700 },
+					);
+					const unreadableRecovery = await runGeneratedShell(
+						shell,
+						`PATH=${unreadableFaultBin}:${shellTestPath()}; export PATH; ${reuse}`,
+					);
+					expect(unreadableRecovery).toMatchObject({ code: 0 });
+					expect(unreadableRecovery.stderr).toContain("recovering stale remote install lock (unreadable-owner)");
+
+					await mkdir(lock, { mode: 0o700 });
+					await writeFile(join(lock, "owner"), "legacy-before-move-race", "utf8");
+					await utimes(lock, new Date(0), new Date(0));
+					const moveFaultBin = join(home, "move-fault-bin");
+					await mkdir(moveFaultBin, { mode: 0o700 });
+					const realMvForRecovery = spawnSync("sh", ["-c", "command -v mv"], {
+						env: { ...process.env, PATH: shellTestPath() },
+						encoding: "utf8",
+					}).stdout.trim();
+					await writeFile(
+						join(moveFaultBin, "mv"),
+						`#!/bin/sh\ncase "$2:$3" in */.install-transaction-lock:*/.lock-recovery-*) rm -rf "$2"; ln -s missing "$2";; esac\nexec ${realMvForRecovery} "$@"\n`,
+						{ mode: 0o700 },
+					);
+					const racedRecovery = await runGeneratedShell(
+						shell,
+						`PATH=${moveFaultBin}:${shellTestPath()}; export PATH; ${reuse}`,
+					);
+					expect(racedRecovery.code).not.toBe(0);
+					expect(racedRecovery.stderr).toContain("unsafe stale remote install lock after recovery move");
+					expect(await runGeneratedShell(shell, reuse)).toMatchObject({
+						code: 0,
+					});
+
 					await mkdir(lock, { mode: 0o700 });
 					await writeFile(join(lock, "owner"), "999999999:1:dead-owner-token:1", "utf8");
 					await utimes(lock, new Date(0), new Date(0));
-					expect(await runGeneratedShell(shell, reuse)).toMatchObject({ code: 0 });
+					expect(await runGeneratedShell(shell, reuse)).toMatchObject({
+						code: 0,
+					});
 
 					const unrelated = spawn("sleep", ["60"], { stdio: "ignore" });
 					try {
@@ -669,11 +755,15 @@ describe("workspace remote paths and command construction", () => {
 							"utf8",
 						);
 						await utimes(lock, new Date(0), new Date(0));
-						expect(await runGeneratedShell(shell, reuse)).toMatchObject({ code: 0 });
+						expect(await runGeneratedShell(shell, reuse)).toMatchObject({
+							code: 0,
+						});
 
 						await mkdir(lock, { mode: 0o700 });
 						await writeFile(join(lock, "owner"), `${unrelated.pid}:${processStart}:hard-ceiling-token:1`, "utf8");
-						expect(await runGeneratedShell(shell, reuse)).toMatchObject({ code: 0 });
+						expect(await runGeneratedShell(shell, reuse)).toMatchObject({
+							code: 0,
+						});
 					} finally {
 						unrelated.kill("SIGKILL");
 					}
@@ -837,10 +927,24 @@ describe("workspace local state", () => {
 	test("persists reconnect identity under 0700/0600 permissions", async () => {
 		const root = await mkdtemp(join("/tmp", "pi-workspace-state-"));
 		try {
-			expect(await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, { root })).toBeUndefined();
-			const state = { revision: REVISION, serverId: SERVER_ID, sessionId: "00000000-0000-4000-8000-000000000002" };
-			await writeWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, state, { root });
-			expect(await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, { root })).toEqual(state);
+			expect(
+				await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, {
+					root,
+				}),
+			).toBeUndefined();
+			const state = {
+				revision: REVISION,
+				serverId: SERVER_ID,
+				sessionId: "00000000-0000-4000-8000-000000000002",
+			};
+			await writeWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, state, {
+				root,
+			});
+			expect(
+				await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, {
+					root,
+				}),
+			).toEqual(state);
 			const stateDirectory = await stat(join(root, "workspace-bcli-10"));
 			expect(stateDirectory.mode & 0o777).toBe(0o700);
 		} finally {
@@ -851,12 +955,22 @@ describe("workspace local state", () => {
 	test("ignores corrupted local state", async () => {
 		const root = await mkdtemp(join("/tmp", "pi-workspace-state-"));
 		try {
-			const state = { revision: REVISION, serverId: SERVER_ID, sessionId: "00000000-0000-4000-8000-000000000002" };
-			await writeWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, state, { root });
+			const state = {
+				revision: REVISION,
+				serverId: SERVER_ID,
+				sessionId: "00000000-0000-4000-8000-000000000002",
+			};
+			await writeWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, state, {
+				root,
+			});
 			const path = join(root, "workspace-bcli-10");
 			const files = await readdir(path);
 			await writeFile(join(path, files[0]!), "{invalid", "utf8");
-			expect(await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, { root })).toBeUndefined();
+			expect(
+				await readWorkspaceLocalState("workspace-bcli-10", REMOTE_CWD, {
+					root,
+				}),
+			).toBeUndefined();
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
