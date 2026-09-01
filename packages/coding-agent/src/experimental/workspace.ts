@@ -286,8 +286,12 @@ function remoteInstallTransactionShell(shareRoot: string): string {
 		` || { printf 'piw: remote install requires Linux procfs process identity and random UUID support\\n' >&2; return 1; }; };` +
 		` read_process_start_time() { case "$1" in ''|*[!0-9]*) return 1;; esac;` +
 		` piw_proc_stat=$(cat /proc/$1/stat 2>/dev/null) || return 1; piw_proc_fields=\${piw_proc_stat##*) };` +
-		` test "$piw_proc_fields" != "$piw_proc_stat" || return 1; set -- $piw_proc_fields; test "$#" -ge 20 || return 1;` +
-		` case "\${20}" in ''|*[!0-9]*) return 1;; esac; printf %s "\${20}"; };` +
+		` test "$piw_proc_fields" != "$piw_proc_stat" || return 1; piw_proc_index=1;` +
+		` while [ "$piw_proc_index" -lt 20 ]; do case "$piw_proc_fields" in *" "*)` +
+		` piw_proc_field=\${piw_proc_fields%% *}; piw_proc_fields=\${piw_proc_fields#* };; *) return 1;; esac;` +
+		` test -n "$piw_proc_field" || return 1; piw_proc_index=$((piw_proc_index+1)); done;` +
+		` piw_proc_start=\${piw_proc_fields%% *}; case "$piw_proc_start" in ''|*[!0-9]*) return 1;; esac;` +
+		` printf %s "$piw_proc_start"; };` +
 		` parse_install_lock_owner() { piw_parsed_pid=\${1%%:*}; piw_owner_rest=\${1#*:};` +
 		` test "$piw_owner_rest" != "$1" || return 1; piw_parsed_start=\${piw_owner_rest%%:*}; piw_owner_rest=\${piw_owner_rest#*:};` +
 		` piw_parsed_token=\${piw_owner_rest%%:*}; piw_parsed_created=\${piw_owner_rest#*:};` +
