@@ -13,6 +13,7 @@ import {
 	buildDdtoolAuthProbeCommand,
 	buildDdtoolDeviceLoginCommand,
 	classifyDdtoolAuthProbe,
+	createDdtoolLoginDisplay,
 	DDTOOL_AUTH_PROBE_TIMEOUT_MS,
 	DDTOOL_DEVICE_LOGIN_TIMEOUT_MS,
 	type DdtoolAuthProbeResult,
@@ -22,7 +23,6 @@ import {
 	manualDdtoolLoginCommand,
 	openDdtoolLoginUrl,
 	orchestrateDdtoolDeviceLogin,
-	stripDdtoolStreamNoise,
 	WorkspaceAuthError,
 	WorkspaceUntrustedDeviceLoginUrlError,
 } from "./workspace-auth.ts";
@@ -1155,34 +1155,6 @@ function defaultPluginPackages(paths: WorkspaceRemotePaths): readonly string[] {
 	];
 }
 
-// The Workspace SSH transport emits known `nc:` proxy noise on stderr; hide it
-// from the login display while the raw stream still feeds URL parsing. Chunks
-// can split a line anywhere, so the filter keeps incomplete lines buffered
-// until the next write and flushes the remainder once the login exits.
-export const createDdtoolLoginDisplay = (): DdtoolDeviceLoginDisplay => {
-	let buffered = "";
-	const write = (chunk: string, flush: boolean): void => {
-		buffered += chunk;
-		const lastNewline = buffered.lastIndexOf("\n");
-		if (lastNewline < 0 && !flush) return;
-		const boundary = flush ? buffered.length : lastNewline + 1;
-		const visible = stripDdtoolStreamNoise(buffered.slice(0, boundary));
-		buffered = buffered.slice(boundary);
-		if (visible.length > 0) process.stdout.write(visible);
-	};
-	return {
-		write: (chunk) => write(chunk, false),
-		log: (message) => console.log(message),
-		close: () => write("", true),
-	};
-};
-
-let ddtoolDeviceLoginDisplay: DdtoolDeviceLoginDisplay | undefined;
-function getDefaultDdtoolLoginDisplay(): DdtoolDeviceLoginDisplay {
-	ddtoolDeviceLoginDisplay ??= createDdtoolLoginDisplay();
-	return ddtoolDeviceLoginDisplay;
-}
-
 /** Bounded non-interactive probe of the Workspace-side ddtool vault session. */
 export async function probeWorkspaceDdtoolAuth(host: string): Promise<DdtoolAuthProbeResult> {
 	const manualCommand = manualDdtoolLoginCommand(host);
@@ -1230,7 +1202,9 @@ function startDdtoolDeviceLoginProcess(
 		child.once("error", (error) =>
 			reject(new WorkspaceAuthError(`Workspace device login SSH spawn failed: ${error.message}`, manualCommand)),
 		);
-		child.once("exit", (code, signal) => resolve({ code, signal, stderr }));
+		// Resolve on "close", not "exit": the process can exit before its stdio
+		// streams drain, and the orchestrator must see every URL-bearing chunk.
+		child.once("close", (code, signal) => resolve({ code, signal, stderr }));
 	});
 	return {
 		exit: exit.finally(() => clearTimeout(killTimer)),
@@ -1278,7 +1252,7 @@ export async function ensureWorkspaceAttachAuth(
 ): Promise<void> {
 	const manualCommand = manualDdtoolLoginCommand(host);
 	const operations = options.loginOperations ?? ddtoolDeviceLoginOperations(host);
-	const display = options.loginDisplay ?? getDefaultDdtoolLoginDisplay();
+	const display = options.loginDisplay ?? createDdtoolLoginDisplay();
 	let state: DdtoolAuthProbeResult;
 	try {
 		state = await probe;
@@ -1322,7 +1296,7 @@ async function runWorkspaceLogin(host: string): Promise<void> {
 	const result = await orchestrateDdtoolDeviceLogin(
 		host,
 		ddtoolDeviceLoginOperations(host),
-		getDefaultDdtoolLoginDisplay(),
+		createDdtoolLoginDisplay(),
 	);
 	if (result.outcome !== "authenticated") {
 		throw new WorkspaceAuthError(`Workspace ddtool login was not completed: ${result.detail}`, manualCommand);

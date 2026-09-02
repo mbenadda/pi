@@ -101,15 +101,15 @@ export interface DdtoolDeviceLoginFlow {
 
 /**
  * Only the URL printed after ddtool's own "Open the following link" prompt is
- * treated as the verification URL, and only once a whitespace terminator has
- * arrived, so a URL split across stream chunks is never opened partially. An
- * older ddtool that falls back to the auth-code flow prints its URL after a
+ * treated as the verification URL, and only once a newline terminator has
+ * arrived, so a URL split across stream chunks is never opened partially and a
+ * transport-noise-truncated URL never reaches validateDdtoolDeviceLoginUrl.
+ * An older ddtool that falls back to the auth-code flow prints its URL after a
  * different prompt ("Launching browser to:"), which this parser deliberately
  * rejects so the laptop never opens a URL whose localhost callback could
  * never complete remotely.
  */
-const DEVICE_LOGIN_URL_PATTERN =
-	/Open the following link in your browser:[^\S\n]*\n[\s]*?(https:\/\/\S+)[^\S\n]*(?=\n)/u;
+const DEVICE_LOGIN_URL_PATTERN = /Open the following link in your browser:[\s\S]{0,400}?(https:\/\/\S+)[^\S\n]*(?=\n)/u;
 const DEVICE_LOGIN_CODE_PATTERN = /enter code ([A-Za-z0-9][A-Za-z0-9-]{3,63})(?=\s)/u;
 
 /**
@@ -189,6 +189,31 @@ export interface DdtoolDeviceLoginDisplay {
 	readonly log: (message: string) => void;
 	/** Optional; implementations that buffer partial lines flush the remainder. */
 	readonly close?: () => void;
+}
+
+/**
+ * Default login display. The Workspace SSH transport emits known `nc:` proxy
+ * noise on stderr; hide it from the display while the raw stream still feeds
+ * URL parsing. Chunks can split a line anywhere, so complete lines are only
+ * emitted once their newline has arrived and the remainder is flushed on
+ * close. One display buffers one login stream; create a fresh one per login.
+ */
+export function createDdtoolLoginDisplay(): DdtoolDeviceLoginDisplay {
+	let buffered = "";
+	const write = (chunk: string, flush: boolean): void => {
+		buffered += chunk;
+		const lastNewline = buffered.lastIndexOf("\n");
+		if (lastNewline < 0 && !flush) return;
+		const boundary = flush ? buffered.length : lastNewline + 1;
+		const visible = stripDdtoolStreamNoise(buffered.slice(0, boundary));
+		buffered = buffered.slice(boundary);
+		if (visible.length > 0) process.stdout.write(visible);
+	};
+	return {
+		write: (chunk) => write(chunk, false),
+		log: (message) => console.log(message),
+		close: () => write("", true),
+	};
 }
 
 export type DdtoolDeviceLoginOutcome =
@@ -276,7 +301,7 @@ export async function orchestrateDdtoolDeviceLogin(
 	// code claims. One exception: a clean exit can mean another concurrent
 	// login already completed the session, so trust only a fresh probe.
 	if (!urlOpened) {
-		if (exit.code === 0 && (await operations.probeAuth()) === "authenticated") {
+		if (exit.code === 0 && (await operations.probeAuth().catch(() => undefined)) === "authenticated") {
 			return { outcome: "authenticated" };
 		}
 		const exitDetail =

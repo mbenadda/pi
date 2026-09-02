@@ -2,15 +2,12 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import {
-	createDdtoolLoginDisplay,
-	ensureWorkspaceAttachAuth,
-	probeWorkspaceDdtoolAuth,
-} from "../src/experimental/workspace.ts";
+import { ensureWorkspaceAttachAuth, probeWorkspaceDdtoolAuth } from "../src/experimental/workspace.ts";
 import {
 	buildDdtoolAuthProbeCommand,
 	buildDdtoolDeviceLoginCommand,
 	classifyDdtoolAuthProbe,
+	createDdtoolLoginDisplay,
 	type DdtoolAuthProbeResult,
 	type DdtoolDeviceLoginDisplay,
 	type DdtoolDeviceLoginOperations,
@@ -49,10 +46,24 @@ const AUTH_CODE_OUTPUT =
 	"\n" +
 	"Waiting for OIDC authentication to complete...\n";
 
-function fakeDisplay(): DdtoolDeviceLoginDisplay & { readonly written: string[]; readonly logged: string[] } {
+function fakeDisplay(): DdtoolDeviceLoginDisplay & {
+	readonly written: string[];
+	readonly logged: string[];
+	closeCalls(): number;
+} {
 	const written: string[] = [];
 	const logged: string[] = [];
-	return { written, logged, write: (chunk) => written.push(chunk), log: (message) => logged.push(message) };
+	let closeCalls = 0;
+	return {
+		close: () => {
+			closeCalls += 1;
+		},
+		written,
+		logged,
+		write: (chunk) => written.push(chunk),
+		log: (message) => logged.push(message),
+		closeCalls: () => closeCalls,
+	};
 }
 
 interface FakeDeviceLoginSpec {
@@ -162,7 +173,7 @@ describe("ddtool device login flow parsing", () => {
 		expect(parseDdtoolDeviceLoginFlow(AUTH_CODE_OUTPUT)).toEqual({});
 	});
 
-	test("requires a whitespace terminator after the verification URL", () => {
+	test("requires a newline terminator after the verification URL", () => {
 		const unterminated = "Open the following link in your browser:\n\n    https://www.google.com/device";
 		expect(parseDdtoolDeviceLoginFlow(unterminated)).toEqual({});
 		expect(parseDdtoolDeviceLoginFlow(`${unterminated}\n`)).toEqual({ url: "https://www.google.com/device" });
@@ -218,6 +229,7 @@ describe("ddtool device login orchestration", () => {
 		expect(display.written).toEqual([DEVICE_LOGIN_OUTPUT]);
 		expect(operations.probeCalls()).toBe(1);
 		expect(operations.aborted()).toBe(false);
+		expect(display.closeCalls()).toBe(1);
 	});
 
 	test("prints the URL when no browser can be opened", async () => {
@@ -259,11 +271,13 @@ describe("ddtool device login orchestration", () => {
 			exit: { code: 0, signal: null, stderr: "" },
 			exitDelayMs: 30_000,
 		});
-		await expect(orchestrateDdtoolDeviceLogin(HOST, operations, fakeDisplay())).rejects.toThrow(
+		const display = fakeDisplay();
+		await expect(orchestrateDdtoolDeviceLogin(HOST, operations, display)).rejects.toThrow(
 			WorkspaceUntrustedDeviceLoginUrlError,
 		);
 		expect(operations.openedUrls).toEqual([]);
 		expect(operations.aborted()).toBe(true);
+		expect(display.closeCalls()).toBe(1);
 	});
 
 	test("aborts and errors when no verification URL is printed within the wait", async () => {
@@ -344,20 +358,23 @@ describe("ddtool device login orchestration", () => {
 	});
 
 	test.each([
-		{ code: 0, signal: null, stderr: "", probeResults: ["expired"] as const },
-		{ code: 7, signal: null, stderr: "vault exploded", probeResults: undefined },
-	] as const)("fails closed when the login exits immediately with code %j and no URL", async (exit) => {
-		const operations = fakeOperations({
-			chunks: [],
-			exit,
-			exitDelayMs: 5,
-			probeResults: exit.probeResults,
-		});
-		await expect(orchestrateDdtoolDeviceLogin(HOST, operations, fakeDisplay())).rejects.toThrow(
-			/before printing a verification URL/,
-		);
-		expect(operations.openedUrls).toEqual([]);
-	});
+		{ exit: { code: 0, signal: null, stderr: "" }, probeResults: ["expired"] as const },
+		{ exit: { code: 7, signal: null, stderr: "vault exploded" }, probeResults: undefined },
+	] as const)(
+		"fails closed when the login exits immediately with code %j and no URL",
+		async ({ exit, probeResults }) => {
+			const operations = fakeOperations({
+				chunks: [],
+				exit,
+				exitDelayMs: 5,
+				probeResults,
+			});
+			await expect(orchestrateDdtoolDeviceLogin(HOST, operations, fakeDisplay())).rejects.toThrow(
+				/before printing a verification URL/,
+			);
+			expect(operations.openedUrls).toEqual([]);
+		},
+	);
 
 	test("trusts a clean no-URL exit when a fresh probe confirms the session", async () => {
 		const operations = fakeOperations({
@@ -365,9 +382,12 @@ describe("ddtool device login orchestration", () => {
 			exit: { code: 0, signal: null, stderr: "" },
 			exitDelayMs: 5,
 		});
-		const result = await orchestrateDdtoolDeviceLogin(HOST, operations, fakeDisplay());
+		const display = fakeDisplay();
+		const result = await orchestrateDdtoolDeviceLogin(HOST, operations, display);
 		expect(result).toEqual({ outcome: "authenticated" });
 		expect(operations.openedUrls).toEqual([]);
+		expect(operations.probeCalls()).toBe(1);
+		expect(display.closeCalls()).toBe(1);
 	});
 
 	test("never opens a URL when transport noise splices into the URL line", async () => {
