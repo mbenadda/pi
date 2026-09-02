@@ -102,8 +102,9 @@ export interface DdtoolDeviceLoginFlow {
 /**
  * Only the URL printed after ddtool's own "Open the following link" prompt is
  * treated as the verification URL, and only once a newline terminator has
- * arrived, so a URL split across stream chunks is never opened partially and a
- * transport-noise-truncated URL never reaches validateDdtoolDeviceLoginUrl.
+ * arrived, so a URL split across stream chunks is never opened partially; a
+ * noise splice that leaves a truncated candidate on its own line still
+ * reaches validateDdtoolDeviceLoginUrl and is rejected there.
  * An older ddtool that falls back to the auth-code flow prints its URL after a
  * different prompt ("Launching browser to:"), which this parser deliberately
  * rejects so the laptop never opens a URL whose localhost callback could
@@ -187,8 +188,8 @@ export interface DdtoolDeviceLoginOperations {
 export interface DdtoolDeviceLoginDisplay {
 	readonly write: (chunk: string) => void;
 	readonly log: (message: string) => void;
-	/** Optional; implementations that buffer partial lines flush the remainder. */
-	readonly close?: () => void;
+	/** The orchestrator calls this once when the login stream ends. */
+	readonly close: () => void;
 }
 
 /**
@@ -211,7 +212,11 @@ export function createDdtoolLoginDisplay(): DdtoolDeviceLoginDisplay {
 	};
 	return {
 		write: (chunk) => write(chunk, false),
-		log: (message) => console.log(message),
+		// Flush the buffer first so a held partial line never prints after this message.
+		log: (message) => {
+			write("", true);
+			console.log(message);
+		},
 		close: () => write("", true),
 	};
 }
@@ -249,7 +254,7 @@ export async function orchestrateDdtoolDeviceLogin(
 		abortLogin?.();
 	};
 	let urlOpened = false;
-	let codeLogged = false;
+	let loggedCode: string | undefined;
 	const loginProcess = operations.startDeviceLogin({
 		onOutput: (chunk) => {
 			output += chunk;
@@ -271,8 +276,8 @@ export async function orchestrateDdtoolDeviceLogin(
 					() => display.log(`Open the Workspace login page: ${url}`),
 				);
 			}
-			if (!codeLogged && flow.userCode !== undefined) {
-				codeLogged = true;
+			if (flow.userCode !== undefined && flow.userCode !== loggedCode) {
+				loggedCode = flow.userCode;
 				display.log(`When the browser asks, enter this code: ${flow.userCode}`);
 			}
 		},
@@ -293,7 +298,7 @@ export async function orchestrateDdtoolDeviceLogin(
 		exit = await loginProcess.exit;
 	} finally {
 		clearTimeout(urlTimer);
-		display.close?.();
+		display.close();
 	}
 	if (failure !== undefined) throw failure;
 	// Fail closed before interpreting exit codes: an exit without a validated,
@@ -301,8 +306,18 @@ export async function orchestrateDdtoolDeviceLogin(
 	// code claims. One exception: a clean exit can mean another concurrent
 	// login already completed the session, so trust only a fresh probe.
 	if (!urlOpened) {
-		if (exit.code === 0 && (await operations.probeAuth().catch(() => undefined)) === "authenticated") {
-			return { outcome: "authenticated" };
+		if (exit.code === 0) {
+			const probe = await operations.probeAuth().then(
+				(result) => result,
+				(error: unknown) => error,
+			);
+			if (probe === "authenticated") return { outcome: "authenticated" };
+			const probeDetail = probe instanceof Error ? `; auth probe then failed: ${probe.message}` : "";
+			throw new WorkspaceAuthError(
+				"Workspace device login exited with code 0 before printing a verification URL; the remote ddtool may be " +
+					`outdated (v1.127.1+ supports device mode)${probeDetail}`,
+				manualCommand,
+			);
 		}
 		const exitDetail =
 			exit.code === null ? `was terminated by signal ${exit.signal ?? "unknown"}` : `exited with code ${exit.code}`;

@@ -496,7 +496,6 @@ describe("workspace ddtool auth policy", () => {
 	});
 
 	test("attach warns and proceeds when the probe transport fails", async () => {
-		const operations = unusedLoginOperations;
 		const console_ = captureConsole();
 		try {
 			await ensureWorkspaceAttachAuth(
@@ -507,7 +506,7 @@ describe("workspace ddtool auth policy", () => {
 						manualDdtoolLoginCommand(HOST),
 					),
 				),
-				{ loginOperations: operations, loginDisplay: fakeDisplay() },
+				{ loginOperations: unusedLoginOperations, loginDisplay: fakeDisplay() },
 			);
 		} finally {
 			console_.restore();
@@ -518,11 +517,10 @@ describe("workspace ddtool auth policy", () => {
 	});
 
 	test("attach warns and proceeds when ddtool is unavailable", async () => {
-		const operations = unusedLoginOperations;
 		const console_ = captureConsole();
 		try {
 			await ensureWorkspaceAttachAuth(HOST, Promise.resolve<DdtoolAuthProbeResult>("unavailable"), {
-				loginOperations: operations,
+				loginOperations: unusedLoginOperations,
 				loginDisplay: fakeDisplay(),
 			});
 		} finally {
@@ -535,11 +533,10 @@ describe("workspace ddtool auth policy", () => {
 	});
 
 	test("attach stays silent when the probe is authenticated", async () => {
-		const operations = unusedLoginOperations;
 		const console_ = captureConsole();
 		try {
 			await ensureWorkspaceAttachAuth(HOST, Promise.resolve<DdtoolAuthProbeResult>("authenticated"), {
-				loginOperations: operations,
+				loginOperations: unusedLoginOperations,
 				loginDisplay: fakeDisplay(),
 			});
 		} finally {
