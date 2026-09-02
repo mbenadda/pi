@@ -227,7 +227,15 @@ export function createDdtoolLoginDisplay(): DdtoolDeviceLoginDisplay {
 			}
 			console.log(message);
 		},
-		close: () => write("", true),
+		close: () => {
+			write("", true);
+			// The flushed remainder is a partial line by construction; terminate it
+			// so output that follows the login stream never glues onto it.
+			if (!atLineStart) {
+				process.stdout.write("\n");
+				atLineStart = true;
+			}
+		},
 	};
 }
 
@@ -317,18 +325,14 @@ export async function orchestrateDdtoolDeviceLogin(
 	// login already completed the session, so trust only a fresh probe.
 	if (!urlOpened) {
 		if (exit.code === 0) {
-			let probe: DdtoolAuthProbeResult | undefined;
-			let probeFailure: string | undefined;
+			let probeDetail: string;
 			try {
-				probe = await operations.probeAuth();
+				const probe = await operations.probeAuth();
+				if (probe === "authenticated") return { outcome: "authenticated" };
+				probeDetail = `; auth probe reports ${probe}`;
 			} catch (error) {
-				probeFailure = error instanceof Error ? error.message : String(error);
+				probeDetail = `; auth probe then failed: ${error instanceof Error ? error.message : String(error)}`;
 			}
-			if (probe === "authenticated") return { outcome: "authenticated" };
-			const probeDetail =
-				probeFailure !== undefined
-					? `; auth probe then failed: ${probeFailure}`
-					: `; auth probe reports ${probe ?? "unknown"}`;
 			throw new WorkspaceAuthError(
 				"Workspace device login exited with code 0 before printing a verification URL; the remote ddtool may be " +
 					`outdated (v1.127.1+ supports device mode)${probeDetail}`,

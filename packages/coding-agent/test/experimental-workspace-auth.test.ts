@@ -491,7 +491,24 @@ describe("ddtool login display filtering", () => {
 			display.write(" to complete...\n");
 			display.write("tail without newline");
 			display.close();
-			expect(console_.output.join("")).toBe("Waiting for OIDC authentication to complete...\ntail without newline");
+			expect(console_.output.join("")).toBe(
+				"Waiting for OIDC authentication to complete...\ntail without newline\n",
+			);
+		} finally {
+			console_.restore();
+		}
+	});
+
+	test("starts a log message on a fresh line after a flushed partial line", () => {
+		const console_ = captureStdout();
+		try {
+			const display = createDdtoolLoginDisplay();
+			display.write("Waiting for OIDC authentication");
+			display.close();
+			display.log("Opened the Workspace login page: https://www.google.com/device");
+			expect(console_.output.join("")).toBe(
+				"Waiting for OIDC authentication\nOpened the Workspace login page: https://www.google.com/device\n",
+			);
 		} finally {
 			console_.restore();
 		}
