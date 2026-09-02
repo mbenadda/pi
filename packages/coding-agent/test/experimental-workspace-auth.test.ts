@@ -361,7 +361,7 @@ describe("ddtool device login orchestration", () => {
 		{ exit: { code: 0, signal: null, stderr: "" }, probeResults: ["expired"] as const },
 		{ exit: { code: 7, signal: null, stderr: "vault exploded" }, probeResults: undefined },
 	] as const)(
-		"fails closed when the login exits immediately with code %j and no URL",
+		"fails closed when the login exits immediately with code $exit.code and no URL",
 		async ({ exit, probeResults }) => {
 			const operations = fakeOperations({
 				chunks: [],
@@ -375,6 +375,21 @@ describe("ddtool device login orchestration", () => {
 			expect(operations.openedUrls).toEqual([]);
 		},
 	);
+
+	test("reports the probe failure when the clean-exit re-probe rejects", async () => {
+		const operations: DdtoolDeviceLoginOperations = {
+			probeAuth: () => Promise.reject(new Error("connection reset")),
+			startDeviceLogin: () =>
+				fakeDeviceLoginProcess(
+					{ chunks: [], exit: { code: 0, signal: null, stderr: "" }, exitDelayMs: 5 },
+					() => {},
+				),
+			openUrl: () => Promise.reject(new Error("url must not open")),
+		};
+		await expect(orchestrateDdtoolDeviceLogin(HOST, operations, fakeDisplay())).rejects.toThrow(
+			/auth probe then failed: connection reset/,
+		);
+	});
 
 	test("trusts a clean no-URL exit when a fresh probe confirms the session", async () => {
 		const operations = fakeOperations({
@@ -441,23 +456,42 @@ async function withFakeSsh(script: string, run: () => Promise<void>): Promise<vo
 describe("ddtool login display filtering", () => {
 	function captureStdout(): { readonly output: string[]; restore(): void } {
 		const output: string[] = [];
-		const spy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
 			output.push(String(chunk));
 			return true;
 		});
-		return { output, restore: () => spy.mockRestore() };
+		const logSpy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+			output.push(`${args.map(String).join(" ")}\n`);
+		});
+		return {
+			output,
+			restore: () => {
+				writeSpy.mockRestore();
+				logSpy.mockRestore();
+			},
+		};
 	}
 
-	test("hides nc: noise split across chunk boundaries and flushes the remainder on close", () => {
+	test("hides split noise, keeps log messages clean, and flushes the remainder on close", () => {
 		const console_ = captureStdout();
 		try {
 			const display = createDdtoolLoginDisplay();
 			display.write("Complete the login via your OIDC provider.\n");
 			display.write("n");
 			display.write("c: proxy noise\n");
-			display.write("enter code RFK-BJB-YSYD");
-			display.close?.();
-			expect(console_.output.join("")).toBe("Complete the login via your OIDC provider.\nenter code RFK-BJB-YSYD");
+			expect(console_.output.join("")).toBe("Complete the login via your OIDC provider.\n");
+
+			display.write("Waiting for OIDC authentication");
+			display.log("enter code RFK-BJB-YSYD");
+			const withMessage = console_.output.join("");
+			expect(withMessage).toContain("enter code RFK-BJB-YSYD\n");
+			expect(withMessage).not.toContain("Waiting for OIDC authenticationenter");
+
+			console_.output.length = 0;
+			display.write(" to complete...\n");
+			display.write("tail without newline");
+			display.close();
+			expect(console_.output.join("")).toBe("Waiting for OIDC authentication to complete...\ntail without newline");
 		} finally {
 			console_.restore();
 		}

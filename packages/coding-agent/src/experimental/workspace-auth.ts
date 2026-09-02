@@ -104,7 +104,8 @@ export interface DdtoolDeviceLoginFlow {
  * treated as the verification URL, and only once a newline terminator has
  * arrived, so a URL split across stream chunks is never opened partially; a
  * noise splice that leaves a truncated candidate on its own line still
- * reaches validateDdtoolDeviceLoginUrl and is rejected there.
+ * reaches validateDdtoolDeviceLoginUrl, whose rejection hard-aborts the
+ * launch as an untrusted URL.
  * An older ddtool that falls back to the auth-code flow prints its URL after a
  * different prompt ("Launching browser to:"), which this parser deliberately
  * rejects so the laptop never opens a URL whose localhost callback could
@@ -201,6 +202,7 @@ export interface DdtoolDeviceLoginDisplay {
  */
 export function createDdtoolLoginDisplay(): DdtoolDeviceLoginDisplay {
 	let buffered = "";
+	let atLineStart = true;
 	const write = (chunk: string, flush: boolean): void => {
 		buffered += chunk;
 		const lastNewline = buffered.lastIndexOf("\n");
@@ -208,13 +210,21 @@ export function createDdtoolLoginDisplay(): DdtoolDeviceLoginDisplay {
 		const boundary = flush ? buffered.length : lastNewline + 1;
 		const visible = stripDdtoolStreamNoise(buffered.slice(0, boundary));
 		buffered = buffered.slice(boundary);
-		if (visible.length > 0) process.stdout.write(visible);
+		if (visible.length > 0) {
+			process.stdout.write(visible);
+			atLineStart = visible.endsWith("\n");
+		}
 	};
 	return {
 		write: (chunk) => write(chunk, false),
-		// Flush the buffer first so a held partial line never prints after this message.
+		// Local messages never glue onto a partial remote line: terminate it
+		// first. The partial line itself stays buffered so whole-line noise
+		// filtering and close-time flushing keep working.
 		log: (message) => {
-			write("", true);
+			if (!atLineStart) {
+				process.stdout.write("\n");
+				atLineStart = true;
+			}
 			console.log(message);
 		},
 		close: () => write("", true),
@@ -307,12 +317,18 @@ export async function orchestrateDdtoolDeviceLogin(
 	// login already completed the session, so trust only a fresh probe.
 	if (!urlOpened) {
 		if (exit.code === 0) {
-			const probe = await operations.probeAuth().then(
-				(result) => result,
-				(error: unknown) => error,
-			);
+			let probe: DdtoolAuthProbeResult | undefined;
+			let probeFailure: string | undefined;
+			try {
+				probe = await operations.probeAuth();
+			} catch (error) {
+				probeFailure = error instanceof Error ? error.message : String(error);
+			}
 			if (probe === "authenticated") return { outcome: "authenticated" };
-			const probeDetail = probe instanceof Error ? `; auth probe then failed: ${probe.message}` : "";
+			const probeDetail =
+				probeFailure !== undefined
+					? `; auth probe then failed: ${probeFailure}`
+					: `; auth probe reports ${probe ?? "unknown"}`;
 			throw new WorkspaceAuthError(
 				"Workspace device login exited with code 0 before printing a verification URL; the remote ddtool may be " +
 					`outdated (v1.127.1+ supports device mode)${probeDetail}`,
