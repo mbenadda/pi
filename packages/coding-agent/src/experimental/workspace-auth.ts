@@ -108,17 +108,20 @@ export interface DdtoolDeviceLoginFlow {
  * rejects so the laptop never opens a URL whose localhost callback could
  * never complete remotely.
  */
-const DEVICE_LOGIN_URL_PATTERN = /Open the following link in your browser:[\s\S]{0,400}?(https:\/\/\S+)(?=\s)/u;
+const DEVICE_LOGIN_URL_PATTERN =
+	/Open the following link in your browser:[^\S\n]*\n[\s]*?(https:\/\/\S+)[^\S\n]*(?=\n)/u;
 const DEVICE_LOGIN_CODE_PATTERN = /enter code ([A-Za-z0-9][A-Za-z0-9-]{3,63})(?=\s)/u;
 
 /**
  * Workspace SSH transports can interleave `nc: ` proxy noise lines into the
- * login stream; they are stripped from the parse buffer and the display.
+ * login stream; they are stripped from the parse buffer and the display. The
+ * match is indentation-tolerant because the transport can splice noise into
+ * a line the remote is still writing.
  */
 export function stripDdtoolStreamNoise(text: string): string {
 	return text
 		.split("\n")
-		.filter((line) => !line.startsWith("nc: "))
+		.filter((line) => !line.trimStart().startsWith("nc: "))
 		.join("\n");
 }
 
@@ -184,6 +187,8 @@ export interface DdtoolDeviceLoginOperations {
 export interface DdtoolDeviceLoginDisplay {
 	readonly write: (chunk: string) => void;
 	readonly log: (message: string) => void;
+	/** Optional; implementations that buffer partial lines flush the remainder. */
+	readonly close?: () => void;
 }
 
 export type DdtoolDeviceLoginOutcome =
@@ -212,9 +217,9 @@ export async function orchestrateDdtoolDeviceLogin(
 	let abortLogin: (() => void) | undefined;
 	let abortRequested = false;
 	const requestAbort = () => {
-		// Captured before the output handlers are wired: a startDeviceLogin
-		// implementation that emits output synchronously must not hang on the
-		// remote bound waiting for an abort handle that does not exist yet.
+		// startDeviceLogin may emit output synchronously, before the abort
+		// handle exists; record the request and replay it once the handle is
+		// available.
 		abortRequested = true;
 		abortLogin?.();
 	};
@@ -247,7 +252,7 @@ export async function orchestrateDdtoolDeviceLogin(
 			}
 		},
 	});
-	abortLogin = loginProcess.abort;
+	abortLogin = () => loginProcess.abort();
 	if (abortRequested) loginProcess.abort();
 	const urlTimer = setTimeout(() => {
 		if (urlOpened || abortRequested) return;
@@ -263,12 +268,17 @@ export async function orchestrateDdtoolDeviceLogin(
 		exit = await loginProcess.exit;
 	} finally {
 		clearTimeout(urlTimer);
+		display.close?.();
 	}
 	if (failure !== undefined) throw failure;
 	// Fail closed before interpreting exit codes: an exit without a validated,
 	// opened URL means the human never reached a login page, whatever the exit
-	// code claims.
+	// code claims. One exception: a clean exit can mean another concurrent
+	// login already completed the session, so trust only a fresh probe.
 	if (!urlOpened) {
+		if (exit.code === 0 && (await operations.probeAuth()) === "authenticated") {
+			return { outcome: "authenticated" };
+		}
 		const exitDetail =
 			exit.code === null ? `was terminated by signal ${exit.signal ?? "unknown"}` : `exited with code ${exit.code}`;
 		throw new WorkspaceAuthError(

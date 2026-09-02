@@ -2,7 +2,11 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { ensureWorkspaceAttachAuth, probeWorkspaceDdtoolAuth } from "../src/experimental/workspace.ts";
+import {
+	createDdtoolLoginDisplay,
+	ensureWorkspaceAttachAuth,
+	probeWorkspaceDdtoolAuth,
+} from "../src/experimental/workspace.ts";
 import {
 	buildDdtoolAuthProbeCommand,
 	buildDdtoolDeviceLoginCommand,
@@ -171,7 +175,7 @@ describe("ddtool device login flow parsing", () => {
 	});
 
 	test("strips nc: transport noise lines", () => {
-		expect(stripDdtoolStreamNoise("nc: noise line\nreal line\nnc: more noise\ncode line\n")).toBe(
+		expect(stripDdtoolStreamNoise("nc: noise line\nreal line\n    nc: indented noise\ncode line\n")).toBe(
 			"real line\ncode line\n",
 		);
 	});
@@ -340,16 +344,43 @@ describe("ddtool device login orchestration", () => {
 	});
 
 	test.each([
-		{ code: 0, signal: null, stderr: "" },
-		{ code: 7, signal: null, stderr: "vault exploded" },
+		{ code: 0, signal: null, stderr: "", probeResults: ["expired"] as const },
+		{ code: 7, signal: null, stderr: "vault exploded", probeResults: undefined },
 	] as const)("fails closed when the login exits immediately with code %j and no URL", async (exit) => {
 		const operations = fakeOperations({
 			chunks: [],
 			exit,
 			exitDelayMs: 5,
+			probeResults: exit.probeResults,
 		});
 		await expect(orchestrateDdtoolDeviceLogin(HOST, operations, fakeDisplay())).rejects.toThrow(
 			/before printing a verification URL/,
+		);
+		expect(operations.openedUrls).toEqual([]);
+	});
+
+	test("trusts a clean no-URL exit when a fresh probe confirms the session", async () => {
+		const operations = fakeOperations({
+			chunks: [],
+			exit: { code: 0, signal: null, stderr: "" },
+			exitDelayMs: 5,
+		});
+		const result = await orchestrateDdtoolDeviceLogin(HOST, operations, fakeDisplay());
+		expect(result).toEqual({ outcome: "authenticated" });
+		expect(operations.openedUrls).toEqual([]);
+	});
+
+	test("never opens a URL when transport noise splices into the URL line", async () => {
+		const operations = fakeOperations({
+			chunks: [
+				"Open the following link in your browser:\n\n    https://www.gnc: proxy noise\n",
+				"oogle.com/device\nWhen prompted, enter code RFK-BJB-YSYD\n",
+			],
+			exit: { code: 0, signal: null, stderr: "" },
+			exitDelayMs: 30_000,
+		});
+		await expect(orchestrateDdtoolDeviceLogin(HOST, operations, fakeDisplay(), { urlWaitMs: 20 })).rejects.toThrow(
+			/printed no verification URL/,
 		);
 		expect(operations.openedUrls).toEqual([]);
 	});
@@ -387,7 +418,40 @@ async function withFakeSsh(script: string, run: () => Promise<void>): Promise<vo
 	}
 }
 
+describe("ddtool login display filtering", () => {
+	function captureStdout(): { readonly output: string[]; restore(): void } {
+		const output: string[] = [];
+		const spy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
+			output.push(String(chunk));
+			return true;
+		});
+		return { output, restore: () => spy.mockRestore() };
+	}
+
+	test("hides nc: noise split across chunk boundaries and flushes the remainder on close", () => {
+		const console_ = captureStdout();
+		try {
+			const display = createDdtoolLoginDisplay();
+			display.write("Complete the login via your OIDC provider.\n");
+			display.write("n");
+			display.write("c: proxy noise\n");
+			display.write("enter code RFK-BJB-YSYD");
+			display.close?.();
+			expect(console_.output.join("")).toBe("Complete the login via your OIDC provider.\nenter code RFK-BJB-YSYD");
+		} finally {
+			console_.restore();
+		}
+	});
+});
+
 describe("workspace ddtool auth policy", () => {
+	const unusedLoginOperations: DdtoolDeviceLoginOperations = {
+		probeAuth: () => Promise.reject(new Error("probe must not run")),
+		startDeviceLogin: () => {
+			throw new Error("device login must not start");
+		},
+		openUrl: () => Promise.reject(new Error("url must not open")),
+	};
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -412,13 +476,7 @@ describe("workspace ddtool auth policy", () => {
 	});
 
 	test("attach warns and proceeds when the probe transport fails", async () => {
-		const operations: DdtoolDeviceLoginOperations = {
-			probeAuth: () => Promise.reject(new Error("probe must not run")),
-			startDeviceLogin: () => {
-				throw new Error("device login must not start");
-			},
-			openUrl: () => Promise.reject(new Error("url must not open")),
-		};
+		const operations = unusedLoginOperations;
 		const console_ = captureConsole();
 		try {
 			await ensureWorkspaceAttachAuth(
@@ -440,16 +498,10 @@ describe("workspace ddtool auth policy", () => {
 	});
 
 	test("attach warns and proceeds when ddtool is unavailable", async () => {
-		const operations: DdtoolDeviceLoginOperations = {
-			probeAuth: () => Promise.reject(new Error("probe must not run")),
-			startDeviceLogin: () => {
-				throw new Error("device login must not start");
-			},
-			openUrl: () => Promise.reject(new Error("url must not open")),
-		};
+		const operations = unusedLoginOperations;
 		const console_ = captureConsole();
 		try {
-			await ensureWorkspaceAttachAuth(HOST, Promise.resolve("unavailable" as DdtoolAuthProbeResult), {
+			await ensureWorkspaceAttachAuth(HOST, Promise.resolve<DdtoolAuthProbeResult>("unavailable"), {
 				loginOperations: operations,
 				loginDisplay: fakeDisplay(),
 			});
@@ -463,16 +515,10 @@ describe("workspace ddtool auth policy", () => {
 	});
 
 	test("attach stays silent when the probe is authenticated", async () => {
-		const operations: DdtoolDeviceLoginOperations = {
-			probeAuth: () => Promise.reject(new Error("probe must not run")),
-			startDeviceLogin: () => {
-				throw new Error("device login must not start");
-			},
-			openUrl: () => Promise.reject(new Error("url must not open")),
-		};
+		const operations = unusedLoginOperations;
 		const console_ = captureConsole();
 		try {
-			await ensureWorkspaceAttachAuth(HOST, Promise.resolve("authenticated" as DdtoolAuthProbeResult), {
+			await ensureWorkspaceAttachAuth(HOST, Promise.resolve<DdtoolAuthProbeResult>("authenticated"), {
 				loginOperations: operations,
 				loginDisplay: fakeDisplay(),
 			});
@@ -486,7 +532,7 @@ describe("workspace ddtool auth policy", () => {
 	test("attach warns and proceeds on a declined login", async () => {
 		const console_ = captureConsole();
 		try {
-			await ensureWorkspaceAttachAuth(HOST, Promise.resolve("expired" as DdtoolAuthProbeResult), {
+			await ensureWorkspaceAttachAuth(HOST, Promise.resolve<DdtoolAuthProbeResult>("expired"), {
 				loginOperations: fakeOperations({
 					chunks: [DEVICE_LOGIN_OUTPUT],
 					exit: { code: 1, signal: null, stderr: "vault is unreachable" },
@@ -507,7 +553,7 @@ describe("workspace ddtool auth policy", () => {
 		const console_ = captureConsole();
 		try {
 			await expect(
-				ensureWorkspaceAttachAuth(HOST, Promise.resolve("expired" as DdtoolAuthProbeResult), {
+				ensureWorkspaceAttachAuth(HOST, Promise.resolve<DdtoolAuthProbeResult>("expired"), {
 					loginOperations: fakeOperations({
 						chunks: ["Open the following link in your browser:\n    https://evil.example.com/device\n"],
 						exit: { code: 0, signal: null, stderr: "" },

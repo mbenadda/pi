@@ -1156,14 +1156,32 @@ function defaultPluginPackages(paths: WorkspaceRemotePaths): readonly string[] {
 }
 
 // The Workspace SSH transport emits known `nc:` proxy noise on stderr; hide it
-// from the login display while the raw stream still feeds URL parsing.
-const ddtoolDeviceLoginDisplay: DdtoolDeviceLoginDisplay = {
-	write: (chunk) => {
-		const visible = stripDdtoolStreamNoise(chunk);
+// from the login display while the raw stream still feeds URL parsing. Chunks
+// can split a line anywhere, so the filter keeps incomplete lines buffered
+// until the next write and flushes the remainder once the login exits.
+export const createDdtoolLoginDisplay = (): DdtoolDeviceLoginDisplay => {
+	let buffered = "";
+	const write = (chunk: string, flush: boolean): void => {
+		buffered += chunk;
+		const lastNewline = buffered.lastIndexOf("\n");
+		if (lastNewline < 0 && !flush) return;
+		const boundary = flush ? buffered.length : lastNewline + 1;
+		const visible = stripDdtoolStreamNoise(buffered.slice(0, boundary));
+		buffered = buffered.slice(boundary);
 		if (visible.length > 0) process.stdout.write(visible);
-	},
-	log: (message) => console.log(message),
+	};
+	return {
+		write: (chunk) => write(chunk, false),
+		log: (message) => console.log(message),
+		close: () => write("", true),
+	};
 };
+
+let ddtoolDeviceLoginDisplay: DdtoolDeviceLoginDisplay | undefined;
+function getDefaultDdtoolLoginDisplay(): DdtoolDeviceLoginDisplay {
+	ddtoolDeviceLoginDisplay ??= createDdtoolLoginDisplay();
+	return ddtoolDeviceLoginDisplay;
+}
 
 /** Bounded non-interactive probe of the Workspace-side ddtool vault session. */
 export async function probeWorkspaceDdtoolAuth(host: string): Promise<DdtoolAuthProbeResult> {
@@ -1178,10 +1196,9 @@ export async function probeWorkspaceDdtoolAuth(host: string): Promise<DdtoolAuth
 		throw error;
 	}
 	if (probe.code === 255) {
-		throw new WorkspaceAuthError(
-			`Workspace ddtool auth probe failed over SSH (exit 255): ${probe.stderr.trim().slice(-400)}`,
-			manualCommand,
-		);
+		const stderrTail = probe.stderr.trim().slice(-400);
+		const detail = stderrTail.length > 0 ? `: ${stderrTail}` : "";
+		throw new WorkspaceAuthError(`Workspace ddtool auth probe failed over SSH (exit 255)${detail}`, manualCommand);
 	}
 	return classifyDdtoolAuthProbe(probe.code);
 }
@@ -1231,14 +1248,6 @@ function ddtoolDeviceLoginOperations(host: string): DdtoolDeviceLoginOperations 
 	};
 }
 
-/**
- * Attach-path auth policy. An expired session runs the device login; every
- * advisory failure (a declined or failed login, an unreachable probe or
- * transport error, a missing ddtool, or a login that never printed a
- * verification URL) warns with the manual command and the `--no-login`
- * alternative and lets the attach proceed. Only an untrusted verification URL
- * hard-aborts: that URL must never be opened or trusted locally.
- */
 function warnWorkspaceAttachAuth(detail: string, manualCommand: string): void {
 	console.error(
 		`piw: warning: Workspace ddtool auth could not be completed: ${detail}; model calls may fail until you ` +
@@ -1251,6 +1260,14 @@ function authFailureDetail(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Attach-path auth policy. An expired session runs the device login; every
+ * advisory failure (a declined or failed login, an unreachable probe or
+ * transport error, a missing ddtool, or a login that never printed a
+ * verification URL) warns with the manual command and the `--no-login`
+ * alternative and lets the attach proceed. Only an untrusted verification URL
+ * hard-aborts: that URL must never be opened or trusted locally.
+ */
 export async function ensureWorkspaceAttachAuth(
 	host: string,
 	probe: Promise<DdtoolAuthProbeResult>,
@@ -1261,7 +1278,7 @@ export async function ensureWorkspaceAttachAuth(
 ): Promise<void> {
 	const manualCommand = manualDdtoolLoginCommand(host);
 	const operations = options.loginOperations ?? ddtoolDeviceLoginOperations(host);
-	const display = options.loginDisplay ?? ddtoolDeviceLoginDisplay;
+	const display = options.loginDisplay ?? getDefaultDdtoolLoginDisplay();
 	let state: DdtoolAuthProbeResult;
 	try {
 		state = await probe;
@@ -1302,7 +1319,11 @@ async function runWorkspaceLogin(host: string): Promise<void> {
 		throw new WorkspaceAuthError(`Workspace ddtool is missing or not executable on ${host}`, manualCommand);
 	}
 	console.log(`Workspace ${host}: ddtool auth is expired; starting the device login…`);
-	const result = await orchestrateDdtoolDeviceLogin(host, ddtoolDeviceLoginOperations(host), ddtoolDeviceLoginDisplay);
+	const result = await orchestrateDdtoolDeviceLogin(
+		host,
+		ddtoolDeviceLoginOperations(host),
+		getDefaultDdtoolLoginDisplay(),
+	);
 	if (result.outcome !== "authenticated") {
 		throw new WorkspaceAuthError(`Workspace ddtool login was not completed: ${result.detail}`, manualCommand);
 	}
