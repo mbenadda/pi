@@ -14,6 +14,8 @@ export interface WorkspaceCommand {
 	readonly cleanup?: boolean;
 	readonly purge?: boolean;
 	readonly update?: boolean;
+	readonly login?: boolean;
+	readonly noLogin?: boolean;
 }
 
 export interface WorkspaceCommandContext {
@@ -45,6 +47,7 @@ const pluginPackageOption = valueOption(
 const statusOption = flagOption("--status");
 const cleanupOption = flagOption("--cleanup");
 const purgeOption = flagOption("--purge");
+const noLoginOption = flagOption("--no-login");
 
 export const workspaceCommand = new Command<WorkspaceCommand, WorkspaceCommandContext>("workspace")
 	.option(sshHostOption)
@@ -55,6 +58,7 @@ export const workspaceCommand = new Command<WorkspaceCommand, WorkspaceCommandCo
 	.option(statusOption)
 	.option(cleanupOption)
 	.option(purgeOption)
+	.option(noLoginOption)
 	.build((input) => {
 		const errors = [...unsupportedOptions("workspace", input)];
 		const sshHost = input.value(sshHostOption);
@@ -65,12 +69,14 @@ export const workspaceCommand = new Command<WorkspaceCommand, WorkspaceCommandCo
 		const status = input.value(statusOption) === true;
 		const cleanup = input.value(cleanupOption) === true;
 		const purge = input.value(purgeOption) === true;
+		const noLogin = input.value(noLoginOption) === true;
 		if (sshHost === undefined) errors.push("--ssh-host is required");
 		if (remoteCwd === undefined) errors.push("--remote-cwd is required");
 		if (requestedSessionId !== undefined && newSession) {
 			errors.push("--session-id and --new-session are mutually exclusive");
 		}
 		if (status && (cleanup || purge)) errors.push("--status cannot be combined with --cleanup or --purge");
+		if (noLogin && (status || cleanup || purge)) errors.push("--no-login requires a launch");
 		if (
 			(status || cleanup || purge) &&
 			(requestedSessionId !== undefined || newSession || pluginPackages.length > 0)
@@ -90,6 +96,7 @@ export const workspaceCommand = new Command<WorkspaceCommand, WorkspaceCommandCo
 				...(status ? { status: true } : {}),
 				...(cleanup ? { cleanup: true } : {}),
 				...(purge ? { purge: true } : {}),
+				...(noLogin ? { noLogin: true } : {}),
 			},
 		};
 	})

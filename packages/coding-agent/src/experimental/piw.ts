@@ -12,21 +12,33 @@ export function workspaceSshHost(name: string): string {
 
 export function parsePiwArgs(args: readonly string[]): WorkspaceCommand {
 	let index = 0;
-	let action: "launch" | "status" | "stop" | "update" = "launch";
+	let action: "launch" | "status" | "stop" | "update" | "login" = "launch";
 	const requestedAction = args[index];
-	if (requestedAction === "status" || requestedAction === "stop" || requestedAction === "update") {
+	if (
+		requestedAction === "status" ||
+		requestedAction === "stop" ||
+		requestedAction === "update" ||
+		requestedAction === "login"
+	) {
 		action = requestedAction;
 		index += 1;
 	}
 	const workspaceName = args[index++];
-	if (workspaceName === undefined) throw new Error("usage: piw [status|stop|update] <workspace> [options]");
+	if (workspaceName === undefined) {
+		throw new Error("usage: piw [status|stop|update|login] <workspace> [options]");
+	}
 	let sshHost = workspaceSshHost(workspaceName);
 	let remoteCwd: string | undefined;
 	let sessionId: string | undefined;
 	let newSession = false;
+	let noLogin = false;
 	const pluginPackages: string[] = [];
 	while (index < args.length) {
 		const argument = args[index++];
+		if (argument === "--no-login") {
+			noLogin = true;
+			continue;
+		}
 		if (argument === "--new" || argument === "--new-session") {
 			newSession = true;
 			continue;
@@ -52,9 +64,11 @@ export function parsePiwArgs(args: readonly string[]): WorkspaceCommand {
 		throw new Error(`Unknown piw option: ${argument}`);
 	}
 	if (sessionId !== undefined && newSession) throw new Error("--session-id and --new are mutually exclusive");
+	if (noLogin && action !== "launch") throw new Error("--no-login requires a launch");
 	if (action !== "launch" && (sessionId !== undefined || newSession || pluginPackages.length > 0)) {
 		throw new Error("Session and plugin selection require a launch");
 	}
+	if (action === "login" && remoteCwd !== undefined) throw new Error("cwd selection requires a launch");
 	return {
 		command: "workspace",
 		workspaceName,
@@ -66,6 +80,8 @@ export function parsePiwArgs(args: readonly string[]): WorkspaceCommand {
 		...(action === "status" ? { status: true } : {}),
 		...(action === "stop" ? { cleanup: true } : {}),
 		...(action === "update" ? { update: true } : {}),
+		...(action === "login" ? { login: true } : {}),
+		...(noLogin ? { noLogin: true } : {}),
 	};
 }
 

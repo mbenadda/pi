@@ -8,12 +8,24 @@ Experimental feature. `piw` keeps presentation on the laptop and runs the agent,
 piw bcli-10
 piw bcli-10 --new
 piw bcli-10 --cwd /home/bits/go/src/github.com/DataDog/dd-source
+piw login bcli-10
+piw bcli-10 --no-login
 piw status bcli-10
 piw stop bcli-10
 piw update bcli-10
 ```
 
 A Workspace name must contain lowercase letters, digits, and interior hyphens. `bcli-10` resolves to the OpenSSH alias `workspace-bcli-10`. The default cwd is `$DATADOG_ROOT/dd-source` when that directory exists, otherwise the absolute, shell-safe `$DATADOG_ROOT`; `--cwd` overrides it. Status, stop, and update do not require `DATADOG_ROOT`. Diagnostic overrides remain available as `--ssh-host`, `--remote-cwd`, `--session-id`, and repeatable `--plugin`.
+
+### ddtool auth automation
+
+Workspace ddtool vault sessions expire roughly every 12 hours. Every launch probes the session non-interactively over SSH with a hard 12-second bound (`timeout -k` because an expired mint hangs inside OIDC refresh and ignores SIGTERM); a healthy probe takes ~135 ms and runs concurrently with install and server-ready work, so healthy attaches gain no noticeable latency.
+
+When the probe reports an expired session, the launch runs `ddtool auth login --mode device --datacenter us1.ddbuild.io` over the validated SSH argv without a TTY, streams its output, validates the printed verification URL (https, expected host shape, no auth-code `redirect_uri`) before opening it in the laptop browser (`open` on macOS, printed elsewhere), surfaces the device code, waits for the human OIDC click-through, and verifies with a fresh probe before opening the TUI. A declined or failed login warns with the exact manual command and lets the attach proceed. A missing ddtool, an untrusted or missing verification URL, or a failed probe aborts with a typed actionable error naming the manual command. `--no-login` skips the probe and orchestration entirely.
+
+`piw login <name>` runs the same probe and device login without attaching; it reports success or exits nonzero with the manual command.
+
+The remote ddtool must be v1.127.1 or newer: older versions accept `--mode device` but silently fall back to the auth-code flow, whose localhost callback can never complete from a laptop browser. The orchestrator detects that output and fails closed with the manual command instead of opening the callback URL.
 
 The first launch or `update` streams the backend bundled with that exact `piw` client. It does not require a Pi checkout, Node, npm, or a source build on the Workspace. Authentication and model configuration remain Workspace-side.
 

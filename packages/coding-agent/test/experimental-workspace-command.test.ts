@@ -220,6 +220,9 @@ describe("experimental workspace command parsing", () => {
 		expect(
 			cli.parse(["workspace", "--ssh-host", "workspace-bcli-10", "--remote-cwd", REMOTE_CWD, "--purge"]),
 		).toMatchObject({ ok: true, command: { purge: true } });
+		expect(
+			cli.parse(["workspace", "--ssh-host", "workspace-bcli-10", "--remote-cwd", REMOTE_CWD, "--no-login"]),
+		).toMatchObject({ ok: true, command: { noLogin: true } });
 	});
 
 	test.each([
@@ -253,6 +256,10 @@ describe("experimental workspace command parsing", () => {
 		[
 			["workspace", "--ssh-host", "workspace-bcli-10", "--remote-cwd", REMOTE_CWD, "--status", "--cleanup"],
 			["--status cannot be combined with --cleanup or --purge"],
+		],
+		[
+			["workspace", "--ssh-host", "workspace-bcli-10", "--remote-cwd", REMOTE_CWD, "--status", "--no-login"],
+			["--no-login requires a launch"],
 		],
 		[
 			[

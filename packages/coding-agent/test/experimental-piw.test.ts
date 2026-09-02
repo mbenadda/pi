@@ -44,8 +44,18 @@ describe("piw daily command", () => {
 		["status", { status: true }],
 		["stop", { cleanup: true }],
 		["update", { update: true }],
+		["login", { login: true }],
 	] as const)("parses %s lifecycle action", (action, expected) => {
 		expect(parsePiwArgs([action, "bcli-10"])).toMatchObject(expected);
+	});
+
+	test("parses --no-login on a launch", () => {
+		expect(parsePiwArgs(["bcli-10", "--no-login"])).toEqual({
+			command: "workspace",
+			workspaceName: "bcli-10",
+			sshHost: "workspace-bcli-10",
+			noLogin: true,
+		});
 	});
 
 	test.each(["BCLI-10", "-bcli", "bcli-", "bad_name", "bad.name", "bad name"])(
@@ -60,5 +70,12 @@ describe("piw daily command", () => {
 		expect(() => parsePiwArgs(["status", "bcli-10", "--new"])).toThrow(/require a launch/);
 		expect(() => parsePiwArgs(["bcli-10", "--ssh-host", "bad host"])).toThrow(/Invalid SSH host/);
 		expect(() => parsePiwArgs([])).toThrow(/usage: piw/);
+	});
+
+	test("rejects --no-login and session selection outside a launch", () => {
+		expect(() => parsePiwArgs(["status", "bcli-10", "--no-login"])).toThrow(/--no-login requires a launch/);
+		expect(() => parsePiwArgs(["login", "bcli-10", "--no-login"])).toThrow(/--no-login requires a launch/);
+		expect(() => parsePiwArgs(["login", "bcli-10", "--new"])).toThrow(/require a launch/);
+		expect(() => parsePiwArgs(["login", "bcli-10", "--cwd", CWD])).toThrow(/cwd selection requires a launch/);
 	});
 });

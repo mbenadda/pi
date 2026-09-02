@@ -10,6 +10,21 @@ import type { WorkspaceCommand } from "../cli/experimental/commands/workspace.ts
 import { getPackageDir } from "../config.ts";
 import { runClientTui } from "./client-tui.ts";
 import {
+	buildDdtoolAuthProbeCommand,
+	buildDdtoolDeviceLoginCommand,
+	classifyDdtoolAuthProbe,
+	DDTOOL_AUTH_PROBE_TIMEOUT_MS,
+	DDTOOL_DEVICE_LOGIN_TIMEOUT_MS,
+	type DdtoolAuthProbeResult,
+	type DdtoolDeviceLoginDisplay,
+	type DdtoolDeviceLoginOperations,
+	type DdtoolDeviceLoginProcess,
+	manualDdtoolLoginCommand,
+	openDdtoolLoginUrl,
+	orchestrateDdtoolDeviceLogin,
+	WorkspaceAuthError,
+} from "./workspace-auth.ts";
+import {
 	type BundledWorkspaceServer,
 	defaultBundledWorkspaceServerRoot,
 	readBundledWorkspaceServer,
@@ -1138,6 +1153,121 @@ function defaultPluginPackages(paths: WorkspaceRemotePaths): readonly string[] {
 	];
 }
 
+// The Workspace SSH transport emits known `nc:` proxy noise on stderr; hide it
+// from the login display while the raw stream still feeds URL parsing.
+const ddtoolDeviceLoginDisplay: DdtoolDeviceLoginDisplay = {
+	write: (chunk) => {
+		const visible = chunk
+			.split("\n")
+			.filter((line) => !line.startsWith("nc: "))
+			.join("\n");
+		if (visible.length > 0) process.stdout.write(visible);
+	},
+	log: (message) => console.log(message),
+};
+
+/** Bounded non-interactive probe of the Workspace-side ddtool vault session. */
+async function probeWorkspaceDdtoolAuth(host: string): Promise<DdtoolAuthProbeResult> {
+	const manualCommand = manualDdtoolLoginCommand(host);
+	let probe: SshExecResult;
+	try {
+		probe = await sshExec(host, buildDdtoolAuthProbeCommand(), { timeoutMs: DDTOOL_AUTH_PROBE_TIMEOUT_MS });
+	} catch (error) {
+		if (error instanceof SshCommandTimeoutError || error instanceof SshCommandSignalError) {
+			throw new WorkspaceAuthError(`Workspace ddtool auth probe failed over SSH: ${error.message}`, manualCommand);
+		}
+		throw error;
+	}
+	return classifyDdtoolAuthProbe(probe.code);
+}
+
+function startDdtoolDeviceLoginProcess(
+	host: string,
+	handlers: { readonly onOutput: (chunk: string) => void },
+): DdtoolDeviceLoginProcess {
+	const args = buildSshCommand(host, buildDdtoolDeviceLoginCommand());
+	const child = spawn(args[0]!, args.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
+	child.stdout.setEncoding("utf8");
+	child.stdout.on("data", handlers.onOutput);
+	child.stderr.setEncoding("utf8");
+	let stderr = "";
+	child.stderr.on("data", (chunk: string) => {
+		// ddtool prints the device-flow output on stderr; feed it to the same
+		// parser/display path as stdout and keep a tail for failure detail.
+		stderr = (stderr + chunk).slice(-MAX_SSH_CAPTURE_BYTES);
+		handlers.onOutput(chunk);
+	});
+	let killTimer: NodeJS.Timeout | undefined;
+	const exit = new Promise<{
+		readonly code: number | null;
+		readonly signal: NodeJS.Signals | null;
+		readonly stderr: string;
+	}>((resolve, reject) => {
+		child.once("error", reject);
+		child.once("exit", (code, signal) => resolve({ code, signal, stderr }));
+	});
+	killTimer = setTimeout(() => child.kill("SIGKILL"), DDTOOL_DEVICE_LOGIN_TIMEOUT_MS);
+	killTimer.unref();
+	return {
+		exit: exit.finally(() => {
+			if (killTimer !== undefined) clearTimeout(killTimer);
+		}),
+		abort: () => {
+			child.kill("SIGKILL");
+		},
+	};
+}
+
+function ddtoolDeviceLoginOperations(host: string): DdtoolDeviceLoginOperations {
+	return {
+		probeAuth: () => probeWorkspaceDdtoolAuth(host),
+		startDeviceLogin: (handlers) => startDdtoolDeviceLoginProcess(host, handlers),
+		openUrl: openDdtoolLoginUrl,
+	};
+}
+
+/**
+ * Attach-path auth policy: an expired session runs the device login; a declined
+ * or failed login warns with the exact manual command and lets the attach
+ * proceed; an unavailable ddtool cannot be fixed automatically and aborts.
+ */
+async function ensureWorkspaceAttachAuth(host: string, state: DdtoolAuthProbeResult): Promise<void> {
+	const manualCommand = manualDdtoolLoginCommand(host);
+	if (state === "unavailable") {
+		throw new WorkspaceAuthError(`Workspace ddtool is missing or not executable on ${host}`, manualCommand);
+	}
+	if (state === "authenticated") return;
+	console.log(`Workspace ${host}: ddtool auth is expired; starting the device login…`);
+	const result = await orchestrateDdtoolDeviceLogin(host, ddtoolDeviceLoginOperations(host), ddtoolDeviceLoginDisplay);
+	if (result.outcome === "authenticated") {
+		console.log(`Workspace ${host}: ddtool login complete.`);
+		return;
+	}
+	console.error(
+		`piw: warning: Workspace ddtool login was not completed: ${result.detail}; model calls may fail ` +
+			`until you log in. Run the login manually:\n  ${manualCommand}`,
+	);
+}
+
+/** `piw login <name>`: probe, orchestrate the device login when expired, and verify. */
+async function runWorkspaceLogin(host: string): Promise<void> {
+	const manualCommand = manualDdtoolLoginCommand(host);
+	const state = await probeWorkspaceDdtoolAuth(host);
+	if (state === "authenticated") {
+		console.log(`Workspace ${host}: ddtool auth is already valid.`);
+		return;
+	}
+	if (state === "unavailable") {
+		throw new WorkspaceAuthError(`Workspace ddtool is missing or not executable on ${host}`, manualCommand);
+	}
+	console.log(`Workspace ${host}: ddtool auth is expired; starting the device login…`);
+	const result = await orchestrateDdtoolDeviceLogin(host, ddtoolDeviceLoginOperations(host), ddtoolDeviceLoginDisplay);
+	if (result.outcome !== "authenticated") {
+		throw new WorkspaceAuthError(`Workspace ddtool login was not completed: ${result.detail}`, manualCommand);
+	}
+	console.log(`Workspace ${host}: ddtool login complete.`);
+}
+
 function resolveSessionId(command: WorkspaceCommand, serverId: string, remoteCwd: string): Promise<string> {
 	if (command.sessionId !== undefined) return Promise.resolve(command.sessionId);
 	if (command.newSession === true) return Promise.resolve(randomUUID());
@@ -1151,6 +1281,10 @@ function resolveSessionId(command: WorkspaceCommand, serverId: string, remoteCwd
 export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 	const host = command.sshHost;
 	if (!isValidSshHost(host)) throw new Error(`Invalid SSH host: ${JSON.stringify(host)}`);
+	if (command.login === true) {
+		await runWorkspaceLogin(host);
+		return;
+	}
 	let repository: LocalRepository | undefined;
 	let bundle: BundledWorkspaceServer | undefined;
 	let paths: WorkspaceRemotePaths;
@@ -1210,6 +1344,13 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 			return;
 		}
 	}
+	// The auth probe runs concurrently with install and server-ready work so a
+	// healthy session adds no noticeable attach latency; it is awaited before
+	// the TUI opens, and an expired session triggers the device login flow.
+	const authProbe = command.noLogin === true ? undefined : probeWorkspaceDdtoolAuth(host);
+	// Mark the early-started probe as handled up front so an attach that aborts
+	// before the await point cannot surface an unhandled rejection.
+	authProbe?.catch(() => {});
 	const remoteCwd = await resolveRemoteCwd(host, command.remoteCwd, true);
 	if (remoteCwd === undefined) throw new Error("Remote working directory resolution failed");
 	const serverId = await ensureRemoteServer(
@@ -1221,6 +1362,10 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 	);
 	const sessionId = await resolveSessionId(command, serverId, remoteCwd);
 	await writeWorkspaceLocalState(host, remoteCwd, { revision: paths.revision, serverId, sessionId });
+
+	if (authProbe !== undefined) {
+		await ensureWorkspaceAttachAuth(host, await authProbe);
+	}
 
 	console.log(`Workspace ${host}: server ${serverId}, session ${sessionId}`);
 	await runClientTui({
