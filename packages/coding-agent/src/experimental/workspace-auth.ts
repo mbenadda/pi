@@ -58,23 +58,35 @@ export function manualDdtoolLoginCommand(host: string): string {
 }
 
 export class WorkspaceAuthError extends Error {
+	readonly reason: string;
 	readonly manualCommand: string;
 
 	constructor(reason: string, manualCommand: string) {
 		super(`${reason}\nRun the login manually:\n  ${manualCommand}`);
 		this.name = "WorkspaceAuthError";
+		this.reason = reason;
 		this.manualCommand = manualCommand;
+	}
+}
+
+/** The one hard-fail kind: a URL that must never be opened in a local browser. */
+export class WorkspaceUntrustedDeviceLoginUrlError extends WorkspaceAuthError {
+	constructor(url: string, manualCommand: string) {
+		super(`Workspace device login printed an untrusted verification URL: ${url}`, manualCommand);
+		this.name = "WorkspaceUntrustedDeviceLoginUrlError";
 	}
 }
 
 export type DdtoolAuthProbeResult = "authenticated" | "expired" | "unavailable";
 
 /**
- * Classifies one probe exit code. 124 (SIGTERM) and 137 (SIGKILL) are the
- * timeout kills of a mint hung in OIDC refresh: the session is expired. 126/127
- * mean ddtool itself is missing or not executable, so no login is possible.
- * Any other nonzero exit is a quick auth failure with a dead session; a device
- * login is the remedy there too.
+ * Classifies one remote probe exit code. 124 (SIGTERM) and 137 (SIGKILL) are
+ * the timeout kills of a mint hung in OIDC refresh: the session is expired.
+ * 126/127 mean ddtool itself is missing or not executable, so no login is
+ * possible. Any other nonzero remote exit is a quick auth failure with a dead
+ * session; a device login is the remedy there too. OpenSSH-level failures
+ * (exit 255) are transport errors and are rejected by the probe caller before
+ * classification.
  */
 export function classifyDdtoolAuthProbe(code: number): DdtoolAuthProbeResult {
 	if (code === 0) return "authenticated";
@@ -89,13 +101,26 @@ export interface DdtoolDeviceLoginFlow {
 
 /**
  * Only the URL printed after ddtool's own "Open the following link" prompt is
- * treated as the verification URL. An older ddtool that falls back to the
- * auth-code flow prints its URL after a different prompt ("Launching browser
- * to:"), which this parser deliberately rejects so the laptop never opens a
- * URL whose localhost callback could never complete remotely.
+ * treated as the verification URL, and only once a whitespace terminator has
+ * arrived, so a URL split across stream chunks is never opened partially. An
+ * older ddtool that falls back to the auth-code flow prints its URL after a
+ * different prompt ("Launching browser to:"), which this parser deliberately
+ * rejects so the laptop never opens a URL whose localhost callback could
+ * never complete remotely.
  */
-const DEVICE_LOGIN_URL_PATTERN = /Open the following link in your browser:\s*\n\s*(https:\/\/[^\s]+)/u;
-const DEVICE_LOGIN_CODE_PATTERN = /enter code ([A-Za-z0-9][A-Za-z0-9-]{3,63})/u;
+const DEVICE_LOGIN_URL_PATTERN = /Open the following link in your browser:[\s\S]{0,400}?(https:\/\/\S+)(?=\s)/u;
+const DEVICE_LOGIN_CODE_PATTERN = /enter code ([A-Za-z0-9][A-Za-z0-9-]{3,63})(?=\s)/u;
+
+/**
+ * Workspace SSH transports can interleave `nc: ` proxy noise lines into the
+ * login stream; they are stripped from the parse buffer and the display.
+ */
+export function stripDdtoolStreamNoise(text: string): string {
+	return text
+		.split("\n")
+		.filter((line) => !line.startsWith("nc: "))
+		.join("\n");
+}
 
 export function parseDdtoolDeviceLoginFlow(output: string): DdtoolDeviceLoginFlow {
 	const url = DEVICE_LOGIN_URL_PATTERN.exec(output)?.[1];
@@ -170,9 +195,10 @@ export type DdtoolDeviceLoginOutcome =
  * Runs one device-mode login attempt to completion. Streams ddtool's output,
  * opens the validated verification URL in the laptop browser as soon as it
  * appears, surfaces the user code, waits for the human click-through, and
- * verifies the result with a fresh probe. Untrusted or missing URLs abort the
- * attempt with a typed WorkspaceAuthError; a declined or failed attempt is
- * reported back so the caller can decide between warning and error.
+ * verifies the result with a fresh probe. Untrusted or missing URLs and an
+ * exit before any URL abort the attempt with a typed WorkspaceAuthError; a
+ * declined or failed attempt is reported back so the caller can decide
+ * between warning and error.
  */
 export async function orchestrateDdtoolDeviceLogin(
 	host: string,
@@ -183,22 +209,27 @@ export async function orchestrateDdtoolDeviceLogin(
 	const manualCommand = manualDdtoolLoginCommand(host);
 	let output = "";
 	let failure: WorkspaceAuthError | undefined;
-	let loginProcess: DdtoolDeviceLoginProcess | undefined;
+	let abortLogin: (() => void) | undefined;
+	let abortRequested = false;
+	const requestAbort = () => {
+		// Captured before the output handlers are wired: a startDeviceLogin
+		// implementation that emits output synchronously must not hang on the
+		// remote bound waiting for an abort handle that does not exist yet.
+		abortRequested = true;
+		abortLogin?.();
+	};
 	let urlOpened = false;
 	let codeLogged = false;
-	loginProcess = operations.startDeviceLogin({
+	const loginProcess = operations.startDeviceLogin({
 		onOutput: (chunk) => {
 			output += chunk;
 			display.write(chunk);
-			const flow = parseDdtoolDeviceLoginFlow(output);
-			if (!urlOpened && flow.url !== undefined) {
+			const flow = parseDdtoolDeviceLoginFlow(stripDdtoolStreamNoise(output));
+			if (!urlOpened && !abortRequested && flow.url !== undefined) {
 				const url = validateDdtoolDeviceLoginUrl(flow.url);
 				if (url === undefined) {
-					failure = new WorkspaceAuthError(
-						`Workspace device login printed an untrusted verification URL: ${flow.url}`,
-						manualCommand,
-					);
-					loginProcess?.abort();
+					failure = new WorkspaceUntrustedDeviceLoginUrlError(flow.url, manualCommand);
+					requestAbort();
 					return;
 				}
 				urlOpened = true;
@@ -216,13 +247,15 @@ export async function orchestrateDdtoolDeviceLogin(
 			}
 		},
 	});
+	abortLogin = loginProcess.abort;
+	if (abortRequested) loginProcess.abort();
 	const urlTimer = setTimeout(() => {
-		if (urlOpened) return;
+		if (urlOpened || abortRequested) return;
 		failure = new WorkspaceAuthError(
 			"Workspace device login printed no verification URL; the remote ddtool may be outdated (v1.127.1+ supports device mode)",
 			manualCommand,
 		);
-		loginProcess?.abort();
+		requestAbort();
 	}, options.urlWaitMs ?? DDTOOL_DEVICE_LOGIN_URL_WAIT_MS);
 	urlTimer.unref();
 	let exit: Awaited<DdtoolDeviceLoginProcess["exit"]>;
@@ -232,10 +265,22 @@ export async function orchestrateDdtoolDeviceLogin(
 		clearTimeout(urlTimer);
 	}
 	if (failure !== undefined) throw failure;
+	// Fail closed before interpreting exit codes: an exit without a validated,
+	// opened URL means the human never reached a login page, whatever the exit
+	// code claims.
+	if (!urlOpened) {
+		const exitDetail =
+			exit.code === null ? `was terminated by signal ${exit.signal ?? "unknown"}` : `exited with code ${exit.code}`;
+		throw new WorkspaceAuthError(
+			`Workspace device login ${exitDetail} before printing a verification URL; the remote ddtool may be ` +
+				"outdated (v1.127.1+ supports device mode)",
+			manualCommand,
+		);
+	}
 	if (exit.code !== 0) {
 		const reason =
 			exit.code === null ? `terminated by signal ${exit.signal ?? "unknown"}` : `exited with code ${exit.code}`;
-		const detail = exit.stderr.trim().length > 0 ? `${reason}: ${exit.stderr.trim().slice(0, 400)}` : reason;
+		const detail = exit.stderr.trim().length > 0 ? `${reason}: ${exit.stderr.trim().slice(-400)}` : reason;
 		return { outcome: "declined", detail: `device login ${detail}` };
 	}
 	const probe = await operations.probeAuth();

@@ -22,7 +22,9 @@ import {
 	manualDdtoolLoginCommand,
 	openDdtoolLoginUrl,
 	orchestrateDdtoolDeviceLogin,
+	stripDdtoolStreamNoise,
 	WorkspaceAuthError,
+	WorkspaceUntrustedDeviceLoginUrlError,
 } from "./workspace-auth.ts";
 import {
 	type BundledWorkspaceServer,
@@ -1157,17 +1159,14 @@ function defaultPluginPackages(paths: WorkspaceRemotePaths): readonly string[] {
 // from the login display while the raw stream still feeds URL parsing.
 const ddtoolDeviceLoginDisplay: DdtoolDeviceLoginDisplay = {
 	write: (chunk) => {
-		const visible = chunk
-			.split("\n")
-			.filter((line) => !line.startsWith("nc: "))
-			.join("\n");
+		const visible = stripDdtoolStreamNoise(chunk);
 		if (visible.length > 0) process.stdout.write(visible);
 	},
 	log: (message) => console.log(message),
 };
 
 /** Bounded non-interactive probe of the Workspace-side ddtool vault session. */
-async function probeWorkspaceDdtoolAuth(host: string): Promise<DdtoolAuthProbeResult> {
+export async function probeWorkspaceDdtoolAuth(host: string): Promise<DdtoolAuthProbeResult> {
 	const manualCommand = manualDdtoolLoginCommand(host);
 	let probe: SshExecResult;
 	try {
@@ -1178,6 +1177,12 @@ async function probeWorkspaceDdtoolAuth(host: string): Promise<DdtoolAuthProbeRe
 		}
 		throw error;
 	}
+	if (probe.code === 255) {
+		throw new WorkspaceAuthError(
+			`Workspace ddtool auth probe failed over SSH (exit 255): ${probe.stderr.trim().slice(-400)}`,
+			manualCommand,
+		);
+	}
 	return classifyDdtoolAuthProbe(probe.code);
 }
 
@@ -1185,6 +1190,7 @@ function startDdtoolDeviceLoginProcess(
 	host: string,
 	handlers: { readonly onOutput: (chunk: string) => void },
 ): DdtoolDeviceLoginProcess {
+	const manualCommand = manualDdtoolLoginCommand(host);
 	const args = buildSshCommand(host, buildDdtoolDeviceLoginCommand());
 	const child = spawn(args[0]!, args.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
 	child.stdout.setEncoding("utf8");
@@ -1197,21 +1203,20 @@ function startDdtoolDeviceLoginProcess(
 		stderr = (stderr + chunk).slice(-MAX_SSH_CAPTURE_BYTES);
 		handlers.onOutput(chunk);
 	});
-	let killTimer: NodeJS.Timeout | undefined;
+	const killTimer = setTimeout(() => child.kill("SIGKILL"), DDTOOL_DEVICE_LOGIN_TIMEOUT_MS);
+	killTimer.unref();
 	const exit = new Promise<{
 		readonly code: number | null;
 		readonly signal: NodeJS.Signals | null;
 		readonly stderr: string;
 	}>((resolve, reject) => {
-		child.once("error", reject);
+		child.once("error", (error) =>
+			reject(new WorkspaceAuthError(`Workspace device login SSH spawn failed: ${error.message}`, manualCommand)),
+		);
 		child.once("exit", (code, signal) => resolve({ code, signal, stderr }));
 	});
-	killTimer = setTimeout(() => child.kill("SIGKILL"), DDTOOL_DEVICE_LOGIN_TIMEOUT_MS);
-	killTimer.unref();
 	return {
-		exit: exit.finally(() => {
-			if (killTimer !== undefined) clearTimeout(killTimer);
-		}),
+		exit: exit.finally(() => clearTimeout(killTimer)),
 		abort: () => {
 			child.kill("SIGKILL");
 		},
@@ -1227,26 +1232,62 @@ function ddtoolDeviceLoginOperations(host: string): DdtoolDeviceLoginOperations 
 }
 
 /**
- * Attach-path auth policy: an expired session runs the device login; a declined
- * or failed login warns with the exact manual command and lets the attach
- * proceed; an unavailable ddtool cannot be fixed automatically and aborts.
+ * Attach-path auth policy. An expired session runs the device login; every
+ * advisory failure (a declined or failed login, an unreachable probe or
+ * transport error, a missing ddtool, or a login that never printed a
+ * verification URL) warns with the manual command and the `--no-login`
+ * alternative and lets the attach proceed. Only an untrusted verification URL
+ * hard-aborts: that URL must never be opened or trusted locally.
  */
-async function ensureWorkspaceAttachAuth(host: string, state: DdtoolAuthProbeResult): Promise<void> {
+function warnWorkspaceAttachAuth(detail: string, manualCommand: string): void {
+	console.error(
+		`piw: warning: Workspace ddtool auth could not be completed: ${detail}; model calls may fail until you ` +
+			`log in. Run the login manually:\n  ${manualCommand}\nOr relaunch with --no-login to attach without the auth check.`,
+	);
+}
+
+function authFailureDetail(error: unknown): string {
+	if (error instanceof WorkspaceAuthError) return error.reason;
+	return error instanceof Error ? error.message : String(error);
+}
+
+export async function ensureWorkspaceAttachAuth(
+	host: string,
+	probe: Promise<DdtoolAuthProbeResult>,
+	options: {
+		readonly loginOperations?: DdtoolDeviceLoginOperations;
+		readonly loginDisplay?: DdtoolDeviceLoginDisplay;
+	} = {},
+): Promise<void> {
 	const manualCommand = manualDdtoolLoginCommand(host);
-	if (state === "unavailable") {
-		throw new WorkspaceAuthError(`Workspace ddtool is missing or not executable on ${host}`, manualCommand);
+	const operations = options.loginOperations ?? ddtoolDeviceLoginOperations(host);
+	const display = options.loginDisplay ?? ddtoolDeviceLoginDisplay;
+	let state: DdtoolAuthProbeResult;
+	try {
+		state = await probe;
+	} catch (error) {
+		warnWorkspaceAttachAuth(authFailureDetail(error), manualCommand);
+		return;
 	}
 	if (state === "authenticated") return;
+	if (state === "unavailable") {
+		warnWorkspaceAttachAuth(`ddtool is missing or not executable on ${host}`, manualCommand);
+		return;
+	}
 	console.log(`Workspace ${host}: ddtool auth is expired; starting the device login…`);
-	const result = await orchestrateDdtoolDeviceLogin(host, ddtoolDeviceLoginOperations(host), ddtoolDeviceLoginDisplay);
+	let result: Awaited<ReturnType<typeof orchestrateDdtoolDeviceLogin>>;
+	try {
+		result = await orchestrateDdtoolDeviceLogin(host, operations, display);
+	} catch (error) {
+		if (error instanceof WorkspaceUntrustedDeviceLoginUrlError) throw error;
+		warnWorkspaceAttachAuth(authFailureDetail(error), manualCommand);
+		return;
+	}
 	if (result.outcome === "authenticated") {
 		console.log(`Workspace ${host}: ddtool login complete.`);
 		return;
 	}
-	console.error(
-		`piw: warning: Workspace ddtool login was not completed: ${result.detail}; model calls may fail ` +
-			`until you log in. Run the login manually:\n  ${manualCommand}`,
-	);
+	warnWorkspaceAttachAuth(result.detail, manualCommand);
 }
 
 /** `piw login <name>`: probe, orchestrate the device login when expired, and verify. */
@@ -1344,9 +1385,10 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 			return;
 		}
 	}
-	// The auth probe runs concurrently with install and server-ready work so a
-	// healthy session adds no noticeable attach latency; it is awaited before
-	// the TUI opens, and an expired session triggers the device login flow.
+	// The auth probe runs concurrently with server discovery and readiness work
+	// so a healthy session adds no noticeable attach latency; it is awaited
+	// before the TUI opens, and an expired session triggers the device login
+	// flow.
 	const authProbe = command.noLogin === true ? undefined : probeWorkspaceDdtoolAuth(host);
 	// Mark the early-started probe as handled up front so an attach that aborts
 	// before the await point cannot surface an unhandled rejection.
@@ -1364,7 +1406,7 @@ export async function runWorkspace(command: WorkspaceCommand): Promise<void> {
 	await writeWorkspaceLocalState(host, remoteCwd, { revision: paths.revision, serverId, sessionId });
 
 	if (authProbe !== undefined) {
-		await ensureWorkspaceAttachAuth(host, await authProbe);
+		await ensureWorkspaceAttachAuth(host, authProbe);
 	}
 
 	console.log(`Workspace ${host}: server ${serverId}, session ${sessionId}`);
