@@ -1,17 +1,30 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, test } from "vitest";
 
 const sourceResolverPath = resolve(__dirname, "../src/experimental/source-resolver.ts");
-// Prefer the built standalone entry (dist/experimental/standalone-cli.js, produced by
-// `npm run build`); fall back to the source entry so the test also runs without a build.
 const builtStandaloneEntry = resolve(__dirname, "../dist/experimental/standalone-cli.js");
-const standaloneEntry = existsSync(builtStandaloneEntry)
-	? builtStandaloneEntry
-	: resolve(__dirname, "../src/experimental/standalone-cli.ts");
+const sourceStandaloneEntry = resolve(__dirname, "../src/experimental/standalone-cli.ts");
+// PI_TEST_STANDALONE_ENTRY forces one entry deterministically: "built" requires the entry
+// produced by `npm run build` and fails when it is missing, "source" runs the checkout sources.
+// Unset, the test exercises the built entry when it exists and the source entry otherwise.
+const requestedEntry = process.env.PI_TEST_STANDALONE_ENTRY;
+if (requestedEntry !== undefined && requestedEntry !== "built" && requestedEntry !== "source") {
+	throw new Error(`PI_TEST_STANDALONE_ENTRY must be "built" or "source", got: ${requestedEntry}`);
+}
+const standaloneEntry = (() => {
+	if (requestedEntry === "source") return sourceStandaloneEntry;
+	if (requestedEntry === "built") {
+		if (!existsSync(builtStandaloneEntry)) {
+			throw new Error(`Built standalone entry is missing: ${builtStandaloneEntry}`);
+		}
+		return builtStandaloneEntry;
+	}
+	return existsSync(builtStandaloneEntry) ? builtStandaloneEntry : sourceStandaloneEntry;
+})();
 
 function standaloneEntryArgs(): string[] {
 	return standaloneEntry.endsWith(".ts") ? ["--import", sourceResolverPath, standaloneEntry] : [standaloneEntry];
@@ -54,6 +67,9 @@ describe.skipIf(process.platform === "win32")("standalone server startup", () =>
 		// limit, so the private state root cannot nest inside the long default temp directory.
 		const stateRoot = existsSync("/tmp") ? "/tmp" : tmpdir();
 		const serverDir = await mkdtemp(join(stateRoot, "pi-ss-"));
+		// mkdtemp already creates 0700; open the directory up so the assertion below proves the
+		// server itself tightens an inherited permissive state directory to a private one.
+		await chmod(serverDir, 0o755);
 		const sessionDir = join(home, "sessions");
 		const readyFile = join(home, "ready");
 		const revision = "0123456789abcdef0123456789abcdef01234567";
@@ -99,7 +115,7 @@ describe.skipIf(process.platform === "win32")("standalone server startup", () =>
 			// Output is async; give the runtime banner a moment to flush before asserting it.
 			expect(await pollUntil(() => output().includes(`Server: ${serverId}`), 5_000), output()).toBe(true);
 
-			// The server state directory must be private to the current user.
+			// The server must make an inherited permissive state directory private.
 			expect((await stat(serverDir)).mode & 0o777).toBe(0o700);
 
 			child.kill("SIGTERM");

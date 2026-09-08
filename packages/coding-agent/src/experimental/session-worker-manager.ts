@@ -469,6 +469,9 @@ export class SessionWorkerManager {
 					path: metadata.path,
 					modifiedAt: metadata.modifiedAt,
 					...(metadata.parentSessionId === undefined ? {} : { parentSessionId: metadata.parentSessionId }),
+					...(metadata.legacyParentSessionPath === undefined
+						? {}
+						: { legacyParentSessionPath: metadata.legacyParentSessionPath }),
 				},
 				pluginManifestPaths: [...pluginManifestPaths],
 				...(this.#model ?? {}),

@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { getPackageDir, isBunBinary, isBundledNode } from "../config.ts";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { isBunBinary, isBundledNode } from "../config.ts";
 
 export const INTERNAL_PROCESS_ENV = "__PI_INTERNAL_SPAWN";
 
@@ -83,12 +83,6 @@ export async function terminateInternalProcess(child: ChildProcess): Promise<voi
 
 function defaultEntryUrl(role: InternalProcessRole, override: URL | undefined): URL {
 	if (override) return override;
-	if (isBundledNode) {
-		// The published stable bundle never ships the experimental role entrypoints. A bundled
-		// Workspace runtime therefore re-enters through the standalone CLI, which dispatches
-		// internal roles before the stable CLI (see experimental/standalone-cli.ts).
-		return pathToFileURL(join(getPackageDir(), "dist", "experimental", "standalone-cli.js"));
-	}
 	const javaScript = import.meta.url.endsWith(".js");
 	if (role === "coordinator") {
 		return new URL(javaScript ? "coordinator.js" : "coordinator.ts", import.meta.url);

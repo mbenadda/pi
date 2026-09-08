@@ -8,7 +8,10 @@
  * measures a process. This walks the value-import graph of every declared entry point and enforces a
  * budget per entry, so that regression fails at commit time instead.
  *
- * Only value imports count. `import type` / `export type` are erased before Node sees them.
+ * Only value imports count. `import type` / `export type` are erased before Node sees them,
+ * as are `typeof import(...)` type references. Literal dynamic imports (`import("./x.ts")`)
+ * are value imports: bundlers follow and bundle them, so the walker must too. Specifiers built
+ * from variables stay untracked, same as a bundler cannot resolve them.
  */
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
@@ -43,6 +46,7 @@ const BUDGETS = {
 };
 
 const SPEC = /(?:^|\n)\s*(?:import|export)\s+(?!type\s)([^;]*?\sfrom\s*)?["']([^"']+)["']/g;
+const DYNAMIC_SPEC = /(?<!typeof\s)\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
 
 function resolveSpec(spec, fromFile) {
 	if (spec.startsWith("node:")) return null;
@@ -72,8 +76,13 @@ export function walk(entryFile) {
 		const file = queue.pop();
 		if (seen.has(file) || file.endsWith(".json")) continue;
 		seen.add(file);
-		for (const match of readFileSync(file, "utf8").matchAll(SPEC)) {
+		const source = readFileSync(file, "utf8");
+		for (const match of source.matchAll(SPEC)) {
 			const target = resolveSpec(match[2], file);
+			if (target) queue.push(target);
+		}
+		for (const match of source.matchAll(DYNAMIC_SPEC)) {
+			const target = resolveSpec(match[1], file);
 			if (target) queue.push(target);
 		}
 	}
@@ -101,7 +110,7 @@ let failures = 0;
 // Workspace fork: the published coding-agent entrypoints (the `pi` bin bundles dist/cli.js,
 // which compiles from src/cli.ts) must never reach the standalone-only trees. Those compile
 // through tsconfig.standalone.json into output the npm tarball excludes.
-const CODING_AGENT_PUBLIC_ENTRIES = ["src/index.ts", "src/cli.ts", "src/rpc-entry.ts"];
+const CODING_AGENT_PUBLIC_ENTRIES = ["src/index.ts", "src/cli.ts", "src/rpc-entry.ts", "src/bun/cli.ts"];
 const CODING_AGENT_STANDALONE_TREES = ["src/client/", "src/experimental/", "src/cli/experimental/"];
 
 function checkCodingAgentPublicEntries() {
@@ -124,48 +133,48 @@ function checkCodingAgentPublicEntries() {
 }
 
 function main() {
-for (const [pkgDir, budgets] of Object.entries(BUDGETS)) {
-	const manifest = JSON.parse(readFileSync(resolve(ROOT, pkgDir, "package.json"), "utf8"));
-	for (const [entry, budget] of Object.entries(budgets)) {
-		const declared = manifest.exports?.[entry];
-		if (!declared) {
-			console.error(`${pkgDir} declares no export "${entry}" but a budget exists for it`);
-			failures += 1;
-			continue;
-		}
-		const target = typeof declared === "string" ? declared : declared.import;
-		for (const [name, distPath] of expand(pkgDir, entry, target)) {
-			const source = sourceFor(pkgDir, distPath);
-			if (!source) {
-				console.error(`${pkgDir} export "${name}" points at ${distPath}, which has no source file`);
+	for (const [pkgDir, budgets] of Object.entries(BUDGETS)) {
+		const manifest = JSON.parse(readFileSync(resolve(ROOT, pkgDir, "package.json"), "utf8"));
+		for (const [entry, budget] of Object.entries(budgets)) {
+			const declared = manifest.exports?.[entry];
+			if (!declared) {
+				console.error(`${pkgDir} declares no export "${entry}" but a budget exists for it`);
 				failures += 1;
 				continue;
 			}
-			const graph = [...walk(source)].map((file) => relative(ROOT, file));
-			if (graph.length > budget.maxFiles) {
-				console.error(
-					`${pkgDir} export "${name}" reaches ${graph.length} files, budget ${budget.maxFiles}\n` +
-						graph.map((file) => `    ${file}`).join("\n"),
-				);
-				failures += 1;
-			}
-			for (const pattern of budget.forbid ?? []) {
-				const hit = graph.filter((file) => file.includes(pattern));
-				if (hit.length > 0) {
-					console.error(`${pkgDir} export "${name}" must not reach ${pattern}:\n${hit.map((f) => `    ${f}`).join("\n")}`);
+			const target = typeof declared === "string" ? declared : declared.import;
+			for (const [name, distPath] of expand(pkgDir, entry, target)) {
+				const source = sourceFor(pkgDir, distPath);
+				if (!source) {
+					console.error(`${pkgDir} export "${name}" points at ${distPath}, which has no source file`);
 					failures += 1;
+					continue;
+				}
+				const graph = [...walk(source)].map((file) => relative(ROOT, file));
+				if (graph.length > budget.maxFiles) {
+					console.error(
+						`${pkgDir} export "${name}" reaches ${graph.length} files, budget ${budget.maxFiles}\n` +
+							graph.map((file) => `    ${file}`).join("\n"),
+					);
+					failures += 1;
+				}
+				for (const pattern of budget.forbid ?? []) {
+					const hit = graph.filter((file) => file.includes(pattern));
+					if (hit.length > 0) {
+						console.error(`${pkgDir} export "${name}" must not reach ${pattern}:\n${hit.map((f) => `    ${f}`).join("\n")}`);
+						failures += 1;
+					}
 				}
 			}
 		}
 	}
-}
-checkCodingAgentPublicEntries();
+	checkCodingAgentPublicEntries();
 
-if (failures > 0) {
-	console.error(`\n${failures} entry-point budget violation(s).`);
-	process.exit(1);
-}
-console.log("Entry point graphs are within budget.");
+	if (failures > 0) {
+		console.error(`\n${failures} entry-point budget violation(s).`);
+		process.exit(1);
+	}
+	console.log("Entry point graphs are within budget.");
 }
 
 const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);

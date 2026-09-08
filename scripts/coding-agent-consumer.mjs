@@ -79,6 +79,9 @@ export function smokeTestCodingAgentConsumer(directory, runtime = process.execPa
 	checkInstalledPackages(join(directory, "node_modules"));
 	const packageDir = join(directory, "node_modules", codingAgentName);
 	const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));
+	// dist/bundle/client.js and dist/bundle/coordinator.js are forward guards: the stable bundle
+	// never emits them today, but the Workspace fork once routed internal roles through those
+	// outputs, so their accidental reappearance must fail the consumer smoke.
 	for (const path of ["dist/client", "dist/experimental", "dist/cli/experimental", "dist/bundle/client.js", "dist/bundle/coordinator.js"]) {
 		if (existsSync(join(packageDir, path))) throw new Error(`Published package contains development-only code: ${path}`);
 	}

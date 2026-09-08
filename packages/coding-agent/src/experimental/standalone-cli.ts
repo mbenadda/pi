@@ -39,10 +39,12 @@ if (internalProcessRole === "coordinator") {
 } else {
 	setupCli();
 	const args = process.argv.slice(2);
-	if (await runExperimentalCommand(args)) {
-		if (args[0] === "client" || args[0] === "workspace") process.exit(process.exitCode ?? 0);
-	} else if (basename(process.execPath) === "piw" || basename(process.argv[1] ?? "") === "piw") {
+	// piw keeps precedence over the experimental commands so a Workspace named "server",
+	// "client", or "workspace" still launches through piw (matches experimental/bun-cli.ts).
+	if (basename(process.execPath) === "piw" || basename(process.argv[1] ?? "") === "piw") {
 		void runPiw(args);
+	} else if (await runExperimentalCommand(args)) {
+		if (args[0] === "client" || args[0] === "workspace") process.exit(process.exitCode ?? 0);
 	} else {
 		await main(args);
 	}

@@ -78,6 +78,8 @@ export const SessionWorkerMetadataSchema = StrictObject({
 	path: Type.String(),
 	modifiedAt: Type.Number(),
 	parentSessionId: Type.Optional(Type.String()),
+	/** Path of an unresolved legacy-v3 parent session file; see JsonlSessionMetadata. */
+	legacyParentSessionPath: Type.Optional(Type.String()),
 });
 
 export const SessionWorkerOptionsSchema = StrictObject({
