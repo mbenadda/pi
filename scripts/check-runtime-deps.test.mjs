@@ -78,6 +78,37 @@ test("allows imported JSON assets outside the TypeScript include pattern", async
 	assert.equal(result.status, 0, result.stderr);
 });
 
+// Workspace fork: the standalone runtime compiles the experimental client/server trees into
+// its binaries, so exactly those trees may import the development-only workspace packages.
+test("allows standalone runtime trees to import development-only workspace packages", async (t) => {
+	const manifest = {
+		name: "@earendil-works/pi-coding-agent",
+		devDependencies: { "@earendil-works/pi-client": "1.0.0", "@earendil-works/pi-protocol": "1.0.0" },
+	};
+	const trees = {
+		"packages/example/src/experimental/piw.ts": 'import { isValidSshHost } from "@earendil-works/pi-client/ssh";',
+		"packages/example/src/client/index.ts": 'import type { JsonValue } from "@earendil-works/pi-protocol";',
+		"packages/example/src/cli/experimental/commands/workspace.ts":
+			'import { isValidSshHost } from "@earendil-works/pi-client/ssh";',
+	};
+	const allowed = await check(t, manifest, "", trees);
+	assert.equal(allowed.status, 0, allowed.stderr);
+
+	const outsideTrees = {
+		"packages/example/src/core/workspace.ts": 'import { isValidSshHost } from "@earendil-works/pi-client/ssh";',
+	};
+	const rejected = await check(t, manifest, "", outsideTrees);
+	assert.equal(rejected.status, 1);
+	assert.match(rejected.stderr, /core[\\\/]workspace\.ts:1: @earendil-works\/pi-client\/ssh is not declared/);
+
+	const otherPackage = {
+		"packages/example/src/experimental/client.ts": 'import { Client } from "@earendil-works/pi-client";',
+	};
+	const scoped = await check(t, {}, "", otherPackage);
+	assert.equal(scoped.status, 1);
+	assert.match(scoped.stderr, /experimental[\\\/]client\.ts:1: @earendil-works\/pi-client is not declared/);
+});
+
 test("permits dev-only dependencies in sources excluded from the published build", async (t) => {
 	const result = await check(t, { devDependencies: { server: "1.0.0" } }, "", {
 		"packages/example/tsconfig.build.json": JSON.stringify({ include: ["src/**/*.ts"], exclude: ["src/experimental"] }),

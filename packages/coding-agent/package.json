@@ -31,8 +31,6 @@
 		"!dist/client",
 		"!dist/experimental",
 		"!dist/cli/experimental",
-		"!dist/bundle/client.js",
-		"!dist/bundle/coordinator.js",
 		"docs",
 		"examples",
 		"containerization.md",

@@ -102,6 +102,31 @@ The server executable has an internal byte-bridge role selected only when invoke
 
 Each start chooses `<exact-revision>:<uuid>` and passes it to the backend with a private readiness file. The backend writes the token only after its private server socket has started and its generation has replaced the coordinator route. The launcher does not probe or attach through the stable public socket until that exact token is visible. An old healthy coordinator generation is therefore not accepted as readiness for a replacement.
 
+## Pi 0.85.1 port
+
+This fork is based on upstream `dev` and now carries the released `v0.85.1` functionality (merge of tag `v0.85.1`; upstream has no `dev` branch ref, `main` is its continuation and `v0.85.1` is an ancestor of `main`). Everything the standalone runtime needs from the release is included: the updated agent harness (named-branch streaming forks, lane-snapshot settled tools, signal-killed process exit codes, prepared-tool preflight abort), the Chord service-wire consolidation the client/server protocol now rides on, the protocol's opaque call envelope, and the TUI stack.
+
+### Packaging boundary
+
+Upstream 0.85.1 makes the experimental client/server commands and the `client`/`experimental/plugin` npm exports development-only: the published CLI no longer dispatches `pi server`/`pi client`, and those packages resolve only from source. This fork keeps the npm policy and diverges only where the standalone runtime requires it:
+
+- `package.json` keeps the source-only `./client` and `./experimental/plugin` exports and the `files` allowlist that excludes `dist/client`, `dist/experimental`, and `dist/cli/experimental` from the published tarball.
+- The stable entrypoints still dispatch `server`, `client`, and `workspace` behind `PI_EXPERIMENTAL=1`, because both the checkout-backed development path (`node dist/bundle/cli.js server`) and the pinned standalone backend (`pi-workspace-server server`) run from the stable bundle/binary. Dispatch lives in `src/experimental/commands.ts`, shared by `main.ts` and the development entrypoint `src/experimental/cli.ts`.
+- `tsconfig.build.json` compiles the development-only trees into `dist` (upstream excludes them) so the standalone bundle and facet toolchain can consume them; the tarball allowlist above keeps them unpublished.
+- `scripts/check-runtime-deps.mjs` allows the development-only trees (`src/client`, `src/experimental`, `src/cli/experimental`) to import `@earendil-works/pi-client`, `pi-protocol`, and `pi-server`, and nothing else. `test/package-distribution.test.ts`, `test/experimental-cli-entry.test.ts`, and `scripts/check-runtime-deps.test.mjs` lock these decisions in.
+
+### Included stable changes
+
+The 0.85.1 TUI improvements are inherited by the Workspace client because it renders through the same `createInteractiveTui`/`createChatViewport`/tool-renderer components: alt-mode scrollbar and accelerated Alt-wheel scrolling, the clickable jump-to-end indicator, linearly scaling fullscreen transcript search, mouse-hover-stable list selection, the restyled working spinner, Zed terminal capability detection, and the SIGWINCH seccomp fix. Also included: statically linked musl `fd`/`ripgrep` downloads on Linux with GitHub-API-free version resolution, skills availability with bash-only tools, isolated concurrent session shares, non-EXIF APP1 segment scanning, in-memory session forks and external entry ingestion, GPT-6 Astra and refreshed model catalogs, NO_PROXY subdomain matching, and the theme-marker and footer fixes.
+
+### Remaining experimental-client gaps
+
+The experimental client TUI is mode-level software; features implemented inside the stable `InteractiveMode` are not automatically present:
+
+- Model and thinking selection use remote `/model` and `/thinking` slash commands only. The stable 0.85.1 interactive pickers — scoped-models cycling (#8900) and the selector save keybindings (#9149) — have no local overlay in the client.
+- First-time setup, project trust prompts, and local extension/skill/theme discovery are laptop-side `InteractiveMode` flows; in the Workspace they are replaced by remote-owned settings, trust, and resources plus the bundled facet plugin API.
+- Local session utilities tied to the stable session manager (HTML export, branch summaries, in-memory fork UX) run on the Workspace backend, not the client, and are reachable only through remote slash commands.
+
 ## Source development path
 
 `PI_EXPERIMENTAL=1 pi workspace --ssh-host <host> --remote-cwd <path>` remains a checkout-backed development command. It retains the older exact-revision staging path for protocol development. Installed `piw` never enters that path: it discovers its embedded manifest next to the executable and fails closed if the manifest, checksum, platform, protocol, or backend archive is missing or inconsistent.
