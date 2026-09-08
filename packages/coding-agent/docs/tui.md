@@ -54,7 +54,7 @@ When a `Focusable` component has focus, TUI:
 3. Positions the hardware terminal cursor at that location
 4. Shows the hardware cursor only when `showHardwareCursor` is enabled
 
-The cursor remains hidden by default. This keeps the fake cursor rendering, while still positioning the hardware cursor for terminals that track IME candidate windows with hidden cursors. Some terminals require a visible hardware cursor for IME positioning; enable it with `showHardwareCursor`, `setShowHardwareCursor(true)`, or `PI_HARDWARE_CURSOR=1`. The `Editor` and `Input` built-in components already implement this interface.
+The cursor remains hidden by default. This keeps the fake cursor rendering, while still positioning the hardware cursor for terminals that track IME candidate windows with hidden cursors. Some terminals require a visible hardware cursor for IME positioning; enable it with the renderer's `showHardwareCursor` constructor argument or `setShowHardwareCursor(true)`. Pi also maps `PI_HARDWARE_CURSOR=1` to this setting before it creates its renderer. The `Editor` and `Input` built-in components already implement this interface.
 
 ### Container Components with Embedded Inputs
 
@@ -930,6 +930,7 @@ export default function (pi: ExtensionAPI) {
 
 - **Extend `CustomEditor`** (not base `Editor`) to get app keybindings (escape to abort, ctrl+d to exit, model switching, etc.)
 - **Call `super.handleInput(data)`** for keys you don't handle
+- **Working status**: custom editors keep the standalone working row by default. Pass `{ embedWorkingStatus: true }` as the fourth `CustomEditor` constructor argument to use the built-in editor-border spinner instead.
 - **Factory pattern**: `setEditorComponent` receives a factory function that gets `tui`, `theme`, and `keybindings`
 - **Pass `undefined`** to restore the default editor: `ctx.ui.setEditorComponent(undefined)`
 

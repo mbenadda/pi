@@ -3,9 +3,7 @@ import { basename } from "node:path";
 import { runCoordinatorProcess } from "../experimental/coordinator.ts";
 import { consumeInternalProcessRole, getInternalProcessRole } from "../experimental/process.ts";
 import { runWorkspaceSshBridge } from "../experimental/workspace-ssh-bridge.ts";
-import { restoreSandboxEnv } from "./restore-sandbox-env.ts";
-
-restoreSandboxEnv();
+import "./sandbox-env-setup.ts";
 
 const internalProcessRole = getInternalProcessRole();
 if (internalProcessRole === "coordinator") {

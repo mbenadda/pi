@@ -16,6 +16,7 @@ import type {
 import { RemoteServiceError } from "./errors.ts";
 import { serviceDeliveryContext } from "./state.ts";
 import { getReplicatedStateInternals, type ReplicatedStateInternals } from "./state-internals.ts";
+import { decodeServiceControlCall } from "./wire.ts";
 
 type RemoteMethod = (...args: unknown[]) => unknown;
 
@@ -59,6 +60,18 @@ interface ServiceRegistration {
 	readonly instances: Map<string, ProviderInstance>;
 	readonly generations: Map<string, number>;
 	readonly subscribers: Set<ProviderSubscriber>;
+}
+
+export type ServiceUpdatePublisher = (
+	subscriptionId: string,
+	update: ServiceProviderUpdate,
+	context: Context,
+) => void | Promise<void>;
+
+/** Hosts one provider for one remote consumer and owns that consumer's subscriptions. */
+export interface RemoteServiceEndpoint {
+	invoke(call: ServiceCall, publish: ServiceUpdatePublisher, context: Context): Promise<JsonValue | undefined>;
+	dispose(): void;
 }
 
 export class RemoteServiceProvider {
@@ -110,7 +123,7 @@ export class RemoteServiceProvider {
 		registration.singletonShape = shape;
 	}
 
-	/** Disconnect one singleton while preserving its active subscriptions and remote facades. */
+	/** Disconnect one singleton while preserving active subscriptions and remote facades. */
 	withdraw<T>(service: Service<T>): void {
 		this.#assertActive();
 		this.#assertRemotable(service);
@@ -134,7 +147,7 @@ export class RemoteServiceProvider {
 		this.#assertSingletonShape(registration, serviceMemberShape(classified.members));
 	}
 
-	/** Replace one singleton while preserving its active subscriptions and remote facades. */
+	/** Replace one singleton without making its stable remote facade unavailable. */
 	replace<T>(service: Service<T>, implementation: NoInfer<RemoteServiceContract<T>>): void {
 		this.#assertActive();
 		this.#assertRemotable(service);
@@ -247,11 +260,19 @@ export class RemoteServiceProvider {
 			activate: () => {
 				if (subscriber.closed || subscriber.active) return;
 				subscriber.active = true;
+				const errors: unknown[] = [];
 				try {
-					for (const entry of subscriber.buffer.splice(0)) listener(entry.update, entry.context);
+					for (const entry of subscriber.buffer.splice(0)) {
+						try {
+							listener(entry.update, entry.context);
+						} catch (error) {
+							errors.push(error);
+						}
+					}
 				} finally {
 					if (subscriber.terminated) subscriber.closed = true;
 				}
+				throwCollectedErrors(errors, "Failed to activate remote service subscription");
 			},
 			close: () => {
 				if (subscriber.closed) return;
@@ -446,12 +467,21 @@ export class RemoteServiceProvider {
 	#emit(registration: ServiceRegistration, update: ServiceProviderUpdate, context?: Context): void {
 		if (registration.subscribers.size === 0) return;
 		const deliveryContext = context ?? serviceDeliveryContext();
+		const errors: unknown[] = [];
 		for (const subscriber of registration.subscribers) {
 			if (subscriber.closed) continue;
 			const entry = { update, context: deliveryContext };
-			if (subscriber.active) subscriber.listener(entry.update, entry.context);
-			else subscriber.buffer.push(entry);
+			if (!subscriber.active) {
+				subscriber.buffer.push(entry);
+				continue;
+			}
+			try {
+				subscriber.listener(entry.update, entry.context);
+			} catch (error) {
+				errors.push(error);
+			}
 		}
+		throwCollectedErrors(errors, `Failed to publish remote service ${registration.serviceId} update`);
 	}
 
 	#assertRemotable(service: { readonly id: string; readonly local: boolean }): void {
@@ -467,6 +497,44 @@ export class RemoteServiceProvider {
 	#assertActive(): void {
 		if (this.#disposed) throw new Error("Remote service provider is disposed");
 	}
+}
+
+export function createRemoteServiceEndpoint(provider: RemoteServiceProvider): RemoteServiceEndpoint {
+	const subscriptions = new Map<string, ServiceSubscription>();
+	let disposed = false;
+
+	return {
+		async invoke(call, publish, context) {
+			if (disposed) throw new Error("Remote service endpoint is disposed");
+			const control = decodeServiceControlCall(call);
+			if (control?.type === "catalogue") return provider.catalogue as unknown as JsonValue;
+			if (control?.type === "subscribe") {
+				if (subscriptions.has(control.subscriptionId)) {
+					throw new Error("Service subscription ID is already active");
+				}
+				const subscription = provider.subscribe(control.serviceId, control.mode, (update, updateContext) => {
+					void Promise.resolve(publish(control.subscriptionId, update, updateContext)).catch(() => {});
+				});
+				subscriptions.set(control.subscriptionId, subscription);
+				subscription.activate();
+				return subscription.snapshot as unknown as JsonValue;
+			}
+			if (control?.type === "unsubscribe") {
+				const subscription = subscriptions.get(control.subscriptionId);
+				if (subscription === undefined) throw new Error("Service subscription was not found");
+				subscription.close();
+				subscriptions.delete(control.subscriptionId);
+				return undefined;
+			}
+			return provider.invoke(call, context);
+		},
+		dispose() {
+			if (disposed) return;
+			disposed = true;
+			for (const subscription of subscriptions.values()) subscription.close();
+			subscriptions.clear();
+		},
+	};
 }
 
 export function validateRemoteServiceImplementation(serviceId: string, implementation: unknown): void {
@@ -499,6 +567,11 @@ function classifyRemoteServiceImplementation(
 	}
 	if (members.size === 0) throw new TypeError(`Remote service ${serviceId} has no members`);
 	return { implementation, members };
+}
+
+function throwCollectedErrors(errors: readonly unknown[], message: string): void {
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1) throw new AggregateError(errors, message);
 }
 
 function serviceMemberShape(members: ReadonlyMap<string, InstanceMember>): ReadonlyMap<string, ServiceMemberKind> {

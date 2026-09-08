@@ -9,10 +9,11 @@ import {
 	type ReplicatedState,
 	replicatedState,
 	type Service,
+	type ServiceCatalogueEntry,
 } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { Client } from "@earendil-works/pi-client";
-import type { ProtocolRpcCall, RpcTarget, ServiceCatalogueEntry, SessionTarget } from "@earendil-works/pi-protocol";
+import { type Client, createClientServiceTransport } from "@earendil-works/pi-client";
+import type { SessionTarget } from "@earendil-works/pi-protocol";
 
 export type ServerConnectionState =
 	| { status: "connecting"; attempt: number }
@@ -118,7 +119,7 @@ class ServerServiceSourceImpl implements ServerServiceSource {
 
 	constructor(client: Client, options: ServiceSourceOptions) {
 		this.#client = client;
-		this.#transport = createRemoteServiceTransport(client, () => ({ serverId: client.serverId }));
+		this.#transport = createClientServiceTransport(client, () => ({ serverId: client.serverId }));
 		this.#onError = options.onError ?? (() => {});
 		this.#connectionAttempt = client.connectionState === "connecting" ? 1 : 0;
 		const connectionState = replicatedState<ServerConnectionState>(
@@ -200,7 +201,7 @@ class SessionServiceSourceImpl implements SessionServiceSource {
 
 	constructor(client: Client, options: ServiceSourceOptions) {
 		this.#client = client;
-		this.#transport = createRemoteServiceTransport(client, () => client.attachment);
+		this.#transport = createClientServiceTransport(client, () => client.attachment);
 		this.#onError = options.onError ?? (() => {});
 		this.#attachmentState = replicatedState<SessionAttachmentState>(
 			client.attachment === undefined
@@ -367,38 +368,6 @@ function publishReplacement<T extends object>(state: MutableReplicatedState<T>, 
 	}
 	Object.assign(target, replacement);
 	state.publish(context);
-}
-
-function createRemoteServiceTransport(client: Client, getTarget: () => RpcTarget | undefined): RemoteServiceTransport {
-	return {
-		invoke: async (call, context) => {
-			const target = getTarget();
-			if (target === undefined) throw new Error("Service connection is not routed");
-			const wireCall: ProtocolRpcCall = {
-				serviceId: call.serviceId,
-				...(call.instance === undefined ? {} : { instance: call.instance }),
-				member: call.member,
-				args: [...call.args],
-			};
-			return client.request(target, wireCall, context.abortSignal);
-		},
-		subscribe: async (serviceId, mode, listener, context) => {
-			const target = getTarget();
-			if (target === undefined) throw new Error("Service connection is not routed");
-			const subscription = await client.subscribeService(
-				target,
-				serviceId,
-				mode,
-				(update) => listener(update, BACKGROUND_CONTEXT),
-				context.abortSignal,
-			);
-			return {
-				snapshot: subscription.snapshot,
-				activate: () => subscription.start(),
-				close: () => subscription.dispose(),
-			};
-		},
-	};
 }
 
 function toServerConnectionState(client: Client, attempt: number, error?: Error): ServerConnectionState {

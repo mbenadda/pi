@@ -1,7 +1,12 @@
 import {
+	createServiceStateEncoder,
+	decodeServiceControlCall,
+	type JsonValue,
+	parseServiceCall,
+	parseServiceSubscriptionSnapshot,
 	RemoteServiceError,
+	type ServiceCall,
 	type ServiceProviderUpdate,
-	type ServiceSubscriptionSnapshot,
 } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, type SessionMetadata, TODO_CONTEXT, withAbortSignal } from "@earendil-works/pi-agent-core";
 import {
@@ -9,15 +14,12 @@ import {
 	type ClientHello,
 	type ClientMessage,
 	ClientMessageDecoder,
-	createServiceStateEncoder,
 	DEFAULT_MAX_FRAME_LENGTH,
-	decodeServiceControlCall,
 	encodeServerMessage,
 	isServerId,
 	isSupportedProtocolVersion,
 	PROTOCOL_VERSION,
 	type ProtocolError,
-	type ProtocolRpcResult,
 	ProtocolValidationError,
 	type RequestEnvelope,
 	type ResponseEnvelope,
@@ -311,11 +313,23 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 			} satisfies ResponseEnvelope);
 			return;
 		}
+		let call: ServiceCall;
+		try {
+			call = parseServiceCall(envelope.call);
+		} catch {
+			await this.sendMessage(state, {
+				type: "response",
+				id: envelope.id,
+				ok: false,
+				error: { code: "invalid_request", message: "Invalid service call" },
+			} satisfies ResponseEnvelope);
+			return;
+		}
 		const controller = new AbortController();
 		const active = { controller, target: envelope.target };
 		state.activeRequests.set(envelope.id, active);
 		const context = withAbortSignal(controller.signal, TODO_CONTEXT);
-		const control = decodeServiceControlCall(envelope.call);
+		const control = decodeServiceControlCall(call);
 		const subscribing = control?.type === "subscribe" ? control : undefined;
 		const pendingUpdates: { readonly update: ServiceProviderUpdate }[] = [];
 		let subscriptionReady = subscribing === undefined;
@@ -333,21 +347,19 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 			if (subscribing !== undefined && state.serviceStateEncoders.has(subscribing.subscriptionId)) {
 				throw new ProtocolValidationError(`Duplicate service subscription ${subscribing.subscriptionId}`);
 			}
-			let result: ProtocolRpcResult;
+			let result: JsonValue | undefined;
 			if ("sessionId" in envelope.target) {
-				result = await this.sessions.executeServiceCall(envelope.call, envelope.target, state, publish, context);
+				result = await this.sessions.executeServiceCall(call, envelope.target, state, publish, context);
 			} else if (state.serverServices !== undefined) {
-				result = await state.serverServices.invokeService(envelope.call, publish, context);
+				result = await state.serverServices.invokeService(call, publish, context);
 			} else {
-				throw new ProtocolValidationError(
-					`Unknown service member ${envelope.call.serviceId}.${envelope.call.member}`,
-				);
+				throw new ProtocolValidationError(`Unknown service member ${call.serviceId}.${call.member}`);
 			}
 			if (subscribing !== undefined) {
 				if (result === undefined)
 					throw new ProtocolValidationError("Service subscription did not return a snapshot");
 				const stateEncoder = createServiceStateEncoder();
-				result = stateEncoder.encodeSnapshot(result as unknown as ServiceSubscriptionSnapshot) as ProtocolRpcResult;
+				result = stateEncoder.encodeSnapshot(parseServiceSubscriptionSnapshot(result)) as unknown as JsonValue;
 				state.serviceStateEncoders.set(subscribing.subscriptionId, stateEncoder);
 				installedSubscriptionEncoder = true;
 			} else if (control?.type === "unsubscribe") {
@@ -433,7 +445,7 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		await this.sendMessage(connection, {
 			type: "service_update",
 			subscriptionId,
-			update: stateEncoder.encodeUpdate(update),
+			update: stateEncoder.encodeUpdate(update) as unknown as JsonValue,
 		});
 	}
 

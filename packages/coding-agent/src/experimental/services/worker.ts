@@ -1,23 +1,17 @@
 import {
 	type Context,
 	createFacetHost,
+	createRemoteServiceEndpoint,
 	createStaticFacetLoader,
 	defineFacet,
 	type FacetHost,
 	type FacetLoader,
-	type ServiceCatalogueEntry,
+	type JsonValue,
+	type RemoteServiceEndpoint,
+	type ServiceCall,
 	type ServiceProviderUpdate,
-	type ServiceSubscription,
 } from "@earendil-works/chord";
 import type { AgentHarness, AgentLane } from "@earendil-works/pi-agent-core";
-import {
-	decodeServiceControlCall,
-	type JsonValue,
-	JsonValueSchema,
-	type ProtocolRpcCall,
-} from "@earendil-works/pi-protocol";
-import Type, { type Static } from "typebox";
-import { Check } from "typebox/value";
 import type { ModelRuntime } from "../../core/model-runtime.ts";
 import type { SettingsManager } from "../../core/settings-manager.ts";
 import { AgentController } from "./agent-controller.ts";
@@ -25,12 +19,6 @@ import { createAgentController } from "./agent-controller-provider.ts";
 import { createModelsServiceFacet } from "./models-provider.ts";
 import { SessionPlugins } from "./plugins.ts";
 import { createTranscriptServiceFacet } from "./transcript-provider.ts";
-
-export const ServiceOperationResultSchema = Type.Object(
-	{ result: Type.Optional(JsonValueSchema) },
-	{ additionalProperties: false },
-);
-export type ServiceOperationResult = Static<typeof ServiceOperationResultSchema>;
 
 export interface SessionWorkerRuntime {
 	readonly harness: AgentHarness;
@@ -45,16 +33,14 @@ export interface WorkerServiceScope {
 	readonly attachmentId: string;
 }
 
-interface WorkerServiceSubscription {
+interface ScopedServiceEndpoint {
 	readonly scope: WorkerServiceScope;
-	readonly subscription: ServiceSubscription;
+	readonly endpoint: RemoteServiceEndpoint;
 }
 
 export interface SessionWorkerServices {
-	readonly catalogue: readonly ServiceCatalogueEntry[];
-	invoke(call: ProtocolRpcCall, scope: WorkerServiceScope, context: Context): Promise<JsonValue | undefined>;
+	invoke(call: ServiceCall, scope: WorkerServiceScope, context: Context): Promise<JsonValue | undefined>;
 	removeSubscriptions(matches: (scope: WorkerServiceScope) => boolean): void;
-	reload(): Promise<void>;
 	dispose(): Promise<void>;
 }
 
@@ -120,42 +106,30 @@ export async function createSessionWorkerServices(options: {
 	};
 	const provider = facetHost.services;
 
-	const subscriptions = new Map<string, WorkerServiceSubscription>();
+	const endpoints = new Map<string, ScopedServiceEndpoint>();
 	const removeSubscriptions = (matches: (scope: WorkerServiceScope) => boolean): void => {
-		for (const [key, entry] of subscriptions) {
+		for (const [key, entry] of endpoints) {
 			if (!matches(entry.scope)) continue;
-			entry.subscription.close();
-			subscriptions.delete(key);
+			entry.endpoint.dispose();
+			endpoints.delete(key);
 		}
 	};
 
 	return {
-		catalogue: provider.catalogue,
-		async invoke(call, scope, context) {
-			const controlCall = decodeServiceControlCall(call);
-			if (controlCall?.type === "catalogue") return toProtocolJsonValue(provider.catalogue);
-			if (controlCall?.type === "subscribe") {
-				const key = scopedSubscriptionKey(scope, controlCall.subscriptionId);
-				if (subscriptions.has(key)) throw new Error("Service subscription ID is already active");
-				const subscription = provider.subscribe(controlCall.serviceId, controlCall.mode, (update) => {
-					void options.publish(scope, controlCall.subscriptionId, update).catch(() => {});
-				});
-				subscriptions.set(key, { scope, subscription });
-				subscription.activate();
-				return toProtocolJsonValue(subscription.snapshot);
+		invoke(call, scope, context) {
+			const key = serviceScopeKey(scope);
+			let entry = endpoints.get(key);
+			if (entry === undefined) {
+				entry = { scope, endpoint: createRemoteServiceEndpoint(provider) };
+				endpoints.set(key, entry);
 			}
-			if (controlCall?.type === "unsubscribe") {
-				const key = scopedSubscriptionKey(scope, controlCall.subscriptionId);
-				const entry = subscriptions.get(key);
-				if (entry === undefined) throw new Error("Service subscription was not found");
-				entry.subscription.close();
-				subscriptions.delete(key);
-				return undefined;
-			}
-			return provider.invoke(call, context);
+			return entry.endpoint.invoke(
+				call,
+				(subscriptionId, update) => options.publish(scope, subscriptionId, update),
+				context,
+			);
 		},
 		removeSubscriptions,
-		reload: () => reloadPlugins(),
 		async dispose() {
 			removeSubscriptions(() => true);
 			await reloadTail;
@@ -173,11 +147,6 @@ export async function createSessionWorkerServices(options: {
 	};
 }
 
-function scopedSubscriptionKey(scope: WorkerServiceScope, subscriptionId: string): string {
-	return `${scope.serverConnectionId}\0${scope.attachmentId}\0${subscriptionId}`;
-}
-
-function toProtocolJsonValue(value: unknown): JsonValue {
-	if (!Check(JsonValueSchema, value)) throw new Error("Service produced invalid JSON");
-	return value;
+function serviceScopeKey(scope: WorkerServiceScope): string {
+	return `${scope.serverConnectionId}\0${scope.attachmentId}`;
 }

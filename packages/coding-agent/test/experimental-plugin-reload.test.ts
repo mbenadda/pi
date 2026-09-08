@@ -1,6 +1,7 @@
 import { defineFacet, type FacetLoader } from "@earendil-works/chord";
-import type { AgentLane, LaneSnapshot } from "@earendil-works/pi-agent-core";
+import { type AgentLane, BACKGROUND_CONTEXT, type LaneSnapshot } from "@earendil-works/pi-agent-core";
 import { describe, expect, test, vi } from "vitest";
+import { SessionPlugins } from "../src/experimental/services/plugins.ts";
 import { createSessionWorkerServices } from "../src/experimental/services/worker.ts";
 
 describe("experimental plugin reload", () => {
@@ -78,7 +79,11 @@ describe("experimental plugin reload", () => {
 		});
 		try {
 			expect(activations).toEqual([1]);
-			await services.reload();
+			await services.invoke(
+				{ serviceId: SessionPlugins.id, member: "reload", args: [] },
+				{ serverConnectionId: "server-1", attachmentId: "attachment-1" },
+				BACKGROUND_CONTEXT,
+			);
 			expect(activations).toEqual([1, 2]);
 			expect(disposals).toEqual([1]);
 		} finally {

@@ -151,7 +151,18 @@ describe("experimental client TUI", () => {
 				transcriptState.state.event = event;
 				transcriptState.publish(BACKGROUND_CONTEXT);
 			};
+			let finishPrompt!: () => void;
+			const promptFinished = new Promise<void>((resolve) => {
+				finishPrompt = resolve;
+			});
 			const prompt = vi.fn(async () => {
+				emitTranscriptEvent({
+					type: "run_start",
+					lane: "main",
+					runId: "run-1",
+					startedAt: 1,
+				});
+				await promptFinished;
 				emitTranscriptEvent({
 					type: "entry_added",
 					lane: "main",
@@ -184,6 +195,15 @@ describe("experimental client TUI", () => {
 							timestamp: 2,
 						},
 					},
+				});
+				emitTranscriptEvent({
+					type: "run_end",
+					lane: "main",
+					runId: "run-1",
+					status: "completed",
+					fromTipId: null,
+					tipId: "entry-assistant",
+					endedAt: 2,
 				});
 				return {
 					ok: true as const,
@@ -349,8 +369,11 @@ describe("experimental client TUI", () => {
 				component.handleInput("hello");
 				component.handleInput("\r");
 				await vi.waitFor(() => expect(prompt).toHaveBeenCalledWith("hello", undefined, BACKGROUND_CONTEXT));
+				await vi.waitFor(() => expect(component.render(80).join("\n")).toContain("Working..."));
+				finishPrompt();
 				await vi.waitFor(() => expect(component.render(80).join("\n")).toContain("remote answer"));
 				expect(component.render(80).join("\n")).toContain("hello");
+				expect(component.render(80).join("\n")).not.toContain("Working...");
 				expect(component.render(80).join("\n")).not.toContain("Operation run-1 completed");
 
 				component.handleInput("/reload");

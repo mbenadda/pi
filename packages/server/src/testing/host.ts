@@ -1,6 +1,6 @@
+import type { JsonValue, ServiceCall } from "@earendil-works/chord";
 import type { Context, Session, SessionMetadata } from "@earendil-works/pi-agent-core";
 import { BACKGROUND_CONTEXT, MemorySessionRepo } from "@earendil-works/pi-agent-core";
-import type { ProtocolRpcCall, ProtocolRpcResult } from "@earendil-works/pi-protocol";
 import { SessionAmbiguousError, SessionNotFoundError } from "../errors.ts";
 import type { RoutedServerServiceHost, RoutedSessionHandle, ServerHost } from "../types.ts";
 
@@ -32,11 +32,11 @@ export class TestHarness {
 	attachedClients = 0;
 	attachmentReleaseCount = 0;
 	closeCount = 0;
-	readonly serviceCalls: ProtocolRpcCall[] = [];
+	readonly serviceCalls: ServiceCall[] = [];
 	failAttachmentRelease?: Error;
 	failClose?: Error;
 	nextServiceError?: Error;
-	nextServiceResult: ProtocolRpcResult = { ok: true };
+	nextServiceResult: JsonValue | undefined = { ok: true };
 	private nextCloseGate?: OpenGate;
 	private nextServiceGate?: OpenGate;
 
@@ -62,7 +62,7 @@ export class TestHarness {
 		};
 	}
 
-	async invokeService(call: ProtocolRpcCall): Promise<ProtocolRpcResult> {
+	async invokeService(call: ServiceCall): Promise<JsonValue | undefined> {
 		this.serviceCalls.push(call);
 		if (this.nextServiceError) {
 			const error = this.nextServiceError;

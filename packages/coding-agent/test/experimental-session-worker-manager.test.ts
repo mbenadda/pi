@@ -1,5 +1,5 @@
+import type { ServiceCall } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, type JsonlSessionMetadata } from "@earendil-works/pi-agent-core";
-import type { ProtocolRpcCall } from "@earendil-works/pi-protocol";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { CoordinatorConnectionEvent } from "../src/experimental/coordinator.ts";
 import { SessionWorkerManager } from "../src/experimental/session-worker-manager.ts";
@@ -194,7 +194,7 @@ describe("Session worker lifecycle failures", () => {
 });
 
 describe("Session worker operations", () => {
-	const serviceCall = { serviceId: "test.session", member: "run", args: ["Hello"] } satisfies ProtocolRpcCall;
+	const serviceCall = { serviceId: "test.session", member: "run", args: ["Hello"] } satisfies ServiceCall;
 
 	test("correlates service results to the worker generation and attachment", async () => {
 		const { coordinator, workers, attachment, release } = await createAttachedWorker();
@@ -213,14 +213,12 @@ describe("Session worker operations", () => {
 							type: "operation_result",
 							requestId: payload.requestId,
 							scope,
-							result: { result: { accepted: true } },
+							result: { accepted: true },
 						},
 					},
 				});
 			});
 		};
-		if (attachment.invokeService === undefined) throw new Error("Missing service attachment");
-
 		await expect(attachment.invokeService(serviceCall, () => {}, BACKGROUND_CONTEXT)).resolves.toEqual({
 			accepted: true,
 		});
@@ -251,14 +249,12 @@ describe("Session worker operations", () => {
 							type: "operation_result",
 							requestId: payload.requestId,
 							scope: payload.scope,
-							result: { result: { accepted: true } },
+							result: { accepted: true },
 						},
 					},
 				}),
 			);
 		};
-		if (attachment.invokeService === undefined) throw new Error("Missing service attachment");
-
 		await expect(attachment.invokeService(serviceCall, () => {}, BACKGROUND_CONTEXT)).rejects.toThrow(
 			/mismatched operation response/,
 		);
@@ -282,14 +278,12 @@ describe("Session worker operations", () => {
 							type: "operation_result",
 							requestId: payload.requestId,
 							scope: null,
-							result: { result: { accepted: true } },
+							result: { accepted: true },
 						},
 					},
 				}),
 			);
 		};
-		if (attachment.invokeService === undefined) throw new Error("Missing service attachment");
-
 		await expect(attachment.invokeService(serviceCall, () => {}, BACKGROUND_CONTEXT)).rejects.toThrow(
 			/invalid operation response/,
 		);
@@ -300,7 +294,6 @@ describe("Session worker operations", () => {
 	test("rejects pending service calls on replacement without stopping the worker", async () => {
 		const { coordinator, workers, attachment } = await createAttachedWorker();
 		coordinator.onSend = () => {};
-		if (attachment.invokeService === undefined) throw new Error("Missing service attachment");
 		const calling = attachment.invokeService(serviceCall, () => {}, BACKGROUND_CONTEXT);
 		workers.detach();
 

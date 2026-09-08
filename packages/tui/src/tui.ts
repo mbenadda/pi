@@ -2,8 +2,6 @@
  * Minimal TUI implementation with differential rendering
  */
 
-import * as os from "node:os";
-import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isKeyRelease, matchesKey } from "./keys.ts";
 import type { Terminal } from "./terminal.ts";
@@ -258,6 +256,14 @@ export interface OverlayUnfocusOptions {
 	target: Component | null;
 }
 
+/** Last rendered terminal-relative overlay rectangle. */
+export interface OverlayBounds {
+	row: number;
+	col: number;
+	width: number;
+	height: number;
+}
+
 /**
  * Handle returned by showOverlay for controlling the overlay
  */
@@ -274,6 +280,8 @@ export interface OverlayHandle {
 	unfocus(options?: OverlayUnfocusOptions): void;
 	/** Check if this overlay currently has focus */
 	isFocused(): boolean;
+	/** Get the most recent rendered bounds for a visible overlay. */
+	getBounds(): OverlayBounds | undefined;
 }
 
 type OverlayStackEntry = {
@@ -282,6 +290,7 @@ type OverlayStackEntry = {
 	preFocus: Component | null;
 	hidden: boolean;
 	focusOrder: number;
+	bounds?: OverlayBounds;
 };
 
 type RenderedOverlayLayout = {
@@ -466,15 +475,16 @@ export abstract class TuiBase extends Container implements TUI {
 	private renderTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
 	private static readonly MIN_RENDER_INTERVAL_MS = 16;
-	private showHardwareCursor = process.env.PI_HARDWARE_CURSOR === "1";
-	private clearOnShrink = process.env.PI_CLEAR_ON_SHRINK === "1";
+	private showHardwareCursor = false;
+	private clearOnShrink = false;
 	protected fullRedrawCount = 0;
 	protected stopped = false;
 	private pendingOsc11BackgroundReplies = 0;
 	private pendingOsc11BackgroundQueries: PendingOsc11BackgroundQuery[] = [];
 	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
 	private terminalColorSchemeNotificationsEnabled = false;
-	protected readonly logDirectory: string;
+	/** Directory for debug/crash logs. When undefined, debug logging is disabled and crash dumps fall back to the OS temp directory. */
+	protected readonly logDirectory: string | undefined;
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
@@ -489,7 +499,7 @@ export abstract class TuiBase extends Container implements TUI {
 	constructor(terminal: Terminal, showHardwareCursor?: boolean, logDirectory?: string) {
 		super();
 		this.terminal = terminal;
-		this.logDirectory = logDirectory ?? process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
+		this.logDirectory = logDirectory;
 		if (showHardwareCursor !== undefined) {
 			this.showHardwareCursor = showHardwareCursor;
 		}
@@ -530,8 +540,8 @@ export abstract class TuiBase extends Container implements TUI {
 
 	/**
 	 * Set whether to trigger full re-render when content shrinks.
-	 * When true (default), empty rows are cleared when content shrinks.
-	 * When false, empty rows remain (reduces redraws on slower terminals).
+	 * When true, empty rows are cleared when content shrinks.
+	 * When false (default), empty rows remain (reduces redraws on slower terminals).
 	 */
 	setClearOnShrink(enabled: boolean): void {
 		this.clearOnShrink = enabled;
@@ -764,6 +774,10 @@ export abstract class TuiBase extends Container implements TUI {
 				this.requestRender();
 			},
 			isFocused: () => this.focusedComponent === component,
+			getBounds: () => {
+				if (!this.overlayStack.includes(entry) || !this.isOverlayVisible(entry) || !entry.bounds) return undefined;
+				return { ...entry.bounds };
+			},
 		};
 	}
 
@@ -1269,6 +1283,8 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 		const result = [...lines];
 
+		for (const entry of this.overlayStack) entry.bounds = undefined;
+
 		// Pre-render all visible overlays and calculate positions
 		const rendered: { entry: OverlayStackEntry; overlayLines: string[]; row: number; col: number; w: number }[] = [];
 		let minLinesNeeded = result.length;
@@ -1292,6 +1308,7 @@ export abstract class TuiBase extends Container implements TUI {
 
 			// Get final row/col with actual overlay height
 			const { row, col } = this.resolveOverlayLayout(options, overlayLines.length, termWidth, termHeight);
+			entry.bounds = { row, col, width, height: overlayLines.length };
 
 			rendered.push({ entry, overlayLines, row, col, w: width });
 			minLinesNeeded = Math.max(minLinesNeeded, row + overlayLines.length);

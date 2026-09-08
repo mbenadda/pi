@@ -1,25 +1,15 @@
 export * from "./cbor/index.ts";
 export * from "./codec.ts";
 export * from "./framing.ts";
-export * from "./json-value.ts";
 export {
 	type AttachmentEnvelope,
 	type CancelEnvelope,
 	type ClientHello,
 	type ClientMessage,
-	createServiceCatalogueCall,
-	createServiceSubscribeCall,
-	createServiceUnsubscribeCall,
-	decodeServiceControlCall,
 	isServerId,
 	PROTOCOL_VERSION,
 	type ProtocolError,
 	type ProtocolErrorCode,
-	type ProtocolRpcCall,
-	ProtocolRpcCallSchema,
-	type ProtocolRpcResult,
-	parseServiceCatalogue,
-	parseServiceSubscriptionSnapshot,
 	type RequestEnvelope,
 	type ResponseEnvelope,
 	type RpcTarget,
@@ -27,14 +17,6 @@ export {
 	type ServerHelloError,
 	type ServerId,
 	type ServerMessage,
-	type ServiceCatalogueEntry,
-	type ServiceErrorCode,
-	ServiceErrorCodeSchema,
 	type ServiceEventEnvelope,
-	type ServiceMode,
-	type ServiceProviderUpdate,
-	ServiceProviderUpdateSchema,
-	type ServiceSubscriptionSnapshot,
 	type SessionTarget,
 } from "./protocol.ts";
-export * from "./service-state.ts";

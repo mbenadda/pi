@@ -3,7 +3,6 @@ import { BACKGROUND_CONTEXT, type LaneWatchEvent } from "@earendil-works/pi-agen
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import { activateBuiltinClientServices, openClientRuntime } from "./client-runtime.ts";
-import { openLaneReplica } from "./lane-replica.ts";
 import type { AgentOperationResponse } from "./services/agent-controller.ts";
 import type { SessionAddress } from "./services/sessions.ts";
 
@@ -82,17 +81,27 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 
 		const agent = match.agent;
 		const completedText = new Map<string, string>();
-		const replica = await openLaneReplica(match.transcript, sessionId, async (event) => {
-			if (event.type === "message_end" && event.runId !== undefined && event.message.role === "assistant") {
-				completedText.set(event.runId, messageText(event.message));
-			}
-			await options.onEvent?.(event);
+		let deliveryTail = Promise.resolve();
+		const unsubscribe = match.transcript.state.subscribe((value, _context, delivery) => {
+			if (delivery.kind !== "update" || value.event === null) return;
+			const event = value.event;
+			deliveryTail = deliveryTail.then(async () => {
+				if (event.type === "message_end" && event.runId !== undefined && event.message.role === "assistant") {
+					completedText.set(event.runId, messageText(event.message));
+				}
+				await options.onEvent?.(event);
+			});
 		});
+		if (match.transcript.state.value?.snapshot === null || match.transcript.state.value?.snapshot === undefined) {
+			unsubscribe();
+			throw new Error("Transcript has no initialized snapshot");
+		}
 		let response: AgentOperationResponse;
 		try {
 			response = await agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT);
 		} finally {
-			await replica.close();
+			unsubscribe();
+			await deliveryTail;
 		}
 		if (!response.accepted) throw new Error(response.error.message);
 		if (response.error !== null) throw new Error(response.error.message);

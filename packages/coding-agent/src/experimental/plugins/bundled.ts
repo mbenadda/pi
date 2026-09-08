@@ -1,5 +1,5 @@
 import * as Chord from "@earendil-works/chord";
-import { combineFacetLoaders, type FacetLoader } from "@earendil-works/chord";
+import { combineFacetLoaders, type FacetLoader, type JsonValue } from "@earendil-works/chord";
 import * as ChordContext from "@earendil-works/chord/context";
 import {
 	createFacetBundleArtifactLoader,
@@ -7,7 +7,6 @@ import {
 	type FacetBundleArtifact,
 	readFacetBundleManifest,
 } from "@earendil-works/chord/node";
-import type { JsonValue } from "@earendil-works/pi-protocol";
 import * as PluginApi from "../plugin.ts";
 
 const PRESENTATION_FACET_BUNDLES_KEY = "presentationFacetBundles";

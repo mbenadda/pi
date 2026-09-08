@@ -1,6 +1,5 @@
-import { defineFacet, type Facet } from "@earendil-works/chord";
+import { defineFacet, type Facet, type JsonValue } from "@earendil-works/chord";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { JsonValue } from "@earendil-works/pi-protocol";
 import { AgentController } from "./agent-controller.ts";
 import { type ModelSummary, Models, type Models as ModelsService } from "./models.ts";
 import { PresentationPlugins, SessionPlugins } from "./plugins.ts";
@@ -17,36 +16,56 @@ const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	max: "Maximum reasoning",
 };
 
+interface RegisteredSlashCommand {
+	readonly command: SlashCommandContribution;
+	closed: boolean;
+}
+
 export class SlashCommandRegistry implements SlashCommands {
-	readonly #commands = new Map<string, SlashCommandContribution>();
+	readonly #commands = new Map<string, RegisteredSlashCommand[]>();
 	readonly #listeners = new Set<(commands: readonly SlashCommandContribution[]) => void>();
 
 	register(command: SlashCommandContribution): () => void {
-		if (!/^[a-z0-9][a-z0-9:-]*$/u.test(command.name)) {
-			throw new TypeError(`Invalid slash command name: ${command.name}`);
-		}
+		this.#validate(command);
 		if (this.#commands.has(command.name)) throw new Error(`Slash command /${command.name} is already registered`);
-		const registered = Object.freeze({ ...command });
-		this.#commands.set(command.name, registered);
-		this.#publish();
-		let closed = false;
-		return () => {
-			if (closed) return;
-			closed = true;
-			if (this.#commands.get(command.name) !== registered) return;
-			this.#commands.delete(command.name);
-			this.#publish();
-		};
+		return this.#add(command);
+	}
+
+	replace(command: SlashCommandContribution): () => void {
+		this.#validate(command);
+		return this.#add(command);
 	}
 
 	list(): readonly SlashCommandContribution[] {
-		return Object.freeze([...this.#commands.values()]);
+		return Object.freeze([...this.#commands.values()].map((entries) => entries[0]!.command));
 	}
 
 	subscribe(listener: (commands: readonly SlashCommandContribution[]) => void): () => void {
 		this.#listeners.add(listener);
 		listener(this.list());
 		return () => this.#listeners.delete(listener);
+	}
+
+	#add(command: SlashCommandContribution): () => void {
+		const entry: RegisteredSlashCommand = { command: Object.freeze({ ...command }), closed: false };
+		const entries = this.#commands.get(command.name) ?? [];
+		entries.push(entry);
+		this.#commands.set(command.name, entries);
+		if (entries.length === 1) this.#publish();
+		return () => {
+			if (entry.closed) return;
+			entry.closed = true;
+			if (entries[0] !== entry) return;
+			while (entries[0]?.closed) entries.shift();
+			if (entries.length === 0) this.#commands.delete(command.name);
+			this.#publish();
+		};
+	}
+
+	#validate(command: SlashCommandContribution): void {
+		if (!/^[a-z0-9][a-z0-9:-]*$/u.test(command.name)) {
+			throw new TypeError(`Invalid slash command name: ${command.name}`);
+		}
 	}
 
 	#publish(): void {
@@ -77,11 +96,11 @@ export function createBuiltInSlashCommandsFacet(options: {
 			const presentationPlugins = env.use(PresentationPlugins);
 			const sessionPlugins = env.use(SessionPlugins);
 			env.onActivate(() => {
-				env.own(commands.register(modelCommand(models, ui)));
-				env.own(commands.register(thinkingCommand(models, ui)));
-				env.own(commands.register(compactCommand(controller, ui)));
+				env.own(commands.replace(modelCommand(models, ui)));
+				env.own(commands.replace(thinkingCommand(models, ui)));
+				env.own(commands.replace(compactCommand(controller, ui)));
 				env.own(
-					commands.register({
+					commands.replace({
 						name: "reload",
 						description: "Reload server-selected plugins",
 						async run(_args, context) {

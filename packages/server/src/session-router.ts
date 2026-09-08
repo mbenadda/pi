@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import type { ServiceProviderUpdate } from "@earendil-works/chord";
+import type { JsonValue, ServiceCall, ServiceProviderUpdate } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, type Context, type SessionMetadata } from "@earendil-works/pi-agent-core";
-import type { ProtocolRpcCall, ProtocolRpcResult, RpcTarget, SessionTarget } from "@earendil-works/pi-protocol";
-import { NotSupportedError, ServerDrainingError, SessionNotAttachedError } from "./errors.ts";
+import type { RpcTarget, SessionTarget } from "@earendil-works/pi-protocol";
+import { ServerDrainingError, SessionNotAttachedError } from "./errors.ts";
 import type { RoutedSessionAttachment, RoutedSessionHandle, ServerHost } from "./types.ts";
 
 class SessionCleanupError extends AggregateError {}
@@ -45,12 +45,12 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 	}
 
 	async executeServiceCall(
-		call: ProtocolRpcCall,
+		call: ServiceCall,
 		target: RpcTarget,
 		client: object,
 		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => Promise<void>,
 		context: Context,
-	): Promise<ProtocolRpcResult> {
+	): Promise<JsonValue | undefined> {
 		const admitted = await this.runForClient(client, () =>
 			this.startServiceCall(client, target, call, publish, context),
 		);
@@ -199,15 +199,12 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 	private async startServiceCall(
 		client: object,
 		target: RpcTarget,
-		call: ProtocolRpcCall,
+		call: ServiceCall,
 		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => Promise<void>,
 		context: Context,
-	): Promise<{ result: Promise<ProtocolRpcResult> }> {
+	): Promise<{ result: Promise<JsonValue | undefined> }> {
 		const attachment = this.requireAttachment(client, target);
-		const invoke = attachment.lease?.invokeService;
-		if (invoke === undefined) throw new NotSupportedError("Routed Session does not support plugin services");
-		const result = invoke.call(
-			attachment.lease,
+		const result = attachment.lease!.invokeService(
 			call,
 			(subscriptionId, update, updateContext) => publish(subscriptionId, update, updateContext),
 			context,

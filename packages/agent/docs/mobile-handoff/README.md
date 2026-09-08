@@ -6,8 +6,8 @@ later units consume earlier ones.
 ```
 01-harness/
   01-delta/            op vocabulary, tracker, applier, codec   [LANDED IN CHORD]
-  02-scopes/           storage scopes, list tags, JSONL encoding [SPEC + type check]
-  03-execenv/          bounded Shell output, capture, spill      [CODE + 29 tests]
+  02-scopes/           storage scopes and list tags              [STEP 1 ACTIONABLE]
+  03-execenv/          bounded Shell output, capture, spill      [PRODUCTION CODE + TESTS]
   04-tool-output/      the ToolOutput sink                       [SPEC ONLY]
   05-assistant-output/ assistant partials, symmetric with 04     [SPEC ONLY]
 02-plugins/
@@ -22,7 +22,7 @@ Base everything on a clean checkout of `origin/dev`.
 **Three units ship working code. Four are specifications.** The table above says
 which. Do not assume a doc describes something that exists.
 
-**`01-delta/FINDINGS.md` is not optional.** The production implementation now lives in `packages/chord/src/delta/index.ts`. Its flush-time dirty-tree design fixes D1 (interleaved paths no longer retain one op per write); D2 remains relevant to rolling-window producers that assign sliced strings, but its 94.5% figure predates flush-time tracking. Re-measure it against production Chord and add an explicit append/truncate producer API before `04-tool-output` if it remains hot. The code beside the handoff is historical prototype evidence, not production source.
+**`01-delta/FINDINGS.md` is historical evidence, not an implementation queue.** Production lives in `packages/chord/src/delta/index.ts`: flush-time dirty tracking fixed D1, and production remeasurement closed D2. The explicit append/truncate API is rejected; see [`01-harness/01-delta/append-decision.md`](01-harness/01-delta/append-decision.md). The code beside the handoff remains prototype and benchmark evidence.
 
 **If a doc and the code disagree, the code wins** — fix the doc and say so in the
 commit.
@@ -39,9 +39,9 @@ five more measurement traps, each of which produced a confident wrong conclusion
 
 | unit | ships | state |
 | --- | --- | --- |
-| **01-delta** | production implementation and tests in `packages/chord`; prototype evidence here | landed; D1 fixed by flush-time tracking, D2 remains for rolling-window producers |
-| **02-scopes** | spec + `scopes.variance.ts` | spec aligned to code; not implemented. The variance check compiles. |
-| **03-execenv** | impl, rewritten bash, 2 diffs, spec | ran green (29 tests). **Its checkpoint policy is wrong** — see `04-tool-output/rate-limiting.md` §5 |
+| **01-delta** | production implementation and tests in `packages/chord`; prototype evidence here | landed; D1 fixed, explicit text API rejected after production remeasurement |
+| **02-scopes** | spec + [actionable Step 1 handoff](01-harness/02-scopes/implementation-handoff.md) + `scopes.variance.ts` | Step 1 scopes/list tags actionable, not implemented; JSONL Chord encoding/address interning deferred to separately approved Step 2 |
+| **03-execenv** | production implementation in `packages/agent`; prototype evidence here | source-bounded adaptive output, lazy spill backpressure, and bash migration landed; bash's temporary checkpoint cadence moves to `ToolOutput` next |
 | **04-tool-output** | spec + design notes | **not built.** The piece every measurement of the op encoding depends on |
 | **05-assistant-output** | spec | not built. Same shape as 04; do it after |
 | **02-plugins/01-facets** | spec, ~1800 lines | not built. §14 rewritten to match the sandbox PoC |
@@ -49,11 +49,9 @@ five more measurement traps, each of which produced a confident wrong conclusion
 
 ## Suggested order
 
-1. **`01-delta` D2** — re-measure against production Chord; if it remains hot, add the explicit append/truncate producer API before the rolling tool-output path depends on it.
-2. **`03-execenv`** — land the shipped code, minus the checkpoint policy and the two redundant knobs (`rate-limiting.md` §5).
-3. **`02-scopes`** — the compiler finds the call sites for you once `Write<Sc>` is invariant.
-4. **`04-tool-output`** — decide the cadence question first (`rate-limiting.md` §4.3 lists what is undecided), then build.
-5. **05**, then **02-plugins**.
+1. **`02-scopes` Step 1** — follow the [actionable implementation handoff](01-harness/02-scopes/implementation-handoff.md); stop for approval before its separate Step 2.
+2. **`04-tool-output`** — reuse the landed adaptive publisher for generic tools, Chord event/durable batches, terminal flushes, and atomic memo checkpoints.
+3. **05**, then **02-plugins**.
 
 ## Live bugs on `origin/dev`, independent of this design
 

@@ -1,5 +1,5 @@
+import type { ServiceCall } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, type SessionMetadata } from "@earendil-works/pi-agent-core";
-import type { ProtocolRpcCall } from "@earendil-works/pi-protocol";
 import { afterEach, describe, expect, test } from "vitest";
 import type { ByteConnection, ByteConnectionHandler } from "../src/connection.ts";
 import { SessionAmbiguousError } from "../src/errors.ts";
@@ -59,7 +59,7 @@ function connect(server: Server): ProtocolTestClient {
 	return client;
 }
 
-function sessionCall(member: string, args: ProtocolRpcCall["args"] = []): ProtocolRpcCall {
+function sessionCall(member: string, args: ServiceCall["args"] = []): ServiceCall {
 	return { serviceId: "test.session", member, args };
 }
 
@@ -87,6 +87,20 @@ describe("Session protocol", () => {
 		expect(host.harnesses.size).toBe(0);
 	});
 
+	test("rejects a semantically invalid service call after envelope decoding", async () => {
+		const host = new TestServerHost();
+		const client = connect(createServer(host));
+		await client.hello();
+		const response = client.next((message) => message.type === "response" && message.id === "invalid-call");
+		await client.sendMessage({
+			type: "request",
+			id: "invalid-call",
+			target: { serverId },
+			call: { arbitrary: true },
+		});
+		expect(await response).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	});
+
 	test("attach passes concrete repository metadata to the Harness host", async () => {
 		type BackendMetadata = SessionMetadata & { path: string; modifiedAt: number };
 		const metadata: BackendMetadata = {
@@ -104,7 +118,7 @@ describe("Session protocol", () => {
 			openSession: async (candidate) => {
 				received = candidate;
 				return {
-					attachClient: () => ({ release() {} }),
+					attachClient: () => ({ invokeService: async () => undefined, release() {} }),
 					close: async () => {},
 				};
 			},
@@ -399,6 +413,7 @@ describe("routed Session acquisition failures", () => {
 					acquiring.resolve(undefined);
 					await continueAcquiring.promise;
 					return {
+						invokeService: async () => undefined,
 						release: () => {
 							releaseCount += 1;
 						},

@@ -66,6 +66,26 @@ the root API.
 Chord-owned identifiers use the `chord.*` namespace and its reserved service
 prefix is `$chord.*`.
 
+## Remote service adapters
+
+Chord owns its transport-independent service wire grammar. Consumer adapters
+use `createServiceCatalogueCall()`, `createServiceSubscribeCall()`, and
+`createServiceUnsubscribeCall()` for `$chord.service` control calls.
+`createRemoteServiceEndpoint()` handles those calls for one provider consumer,
+including subscription activation and cleanup. `parseServiceCall()`,
+`parseServiceCatalogue()`, and the decoded/wire snapshot and update parsers
+validate Chord semantics after an adapter has established a strict-JSON
+boundary. `RemoteServiceErrorCode` and `REMOTE_SERVICE_ERROR_CODES` define the
+service errors that may cross that boundary.
+
+Replicated state operations use one `createServiceStateEncoder()` at the
+provider side and one `createServiceStateDecoder()` at the consumer side for
+each subscription. Those registries create an independent Delta path dictionary
+for every instance/member state and reset it on replacement, unavailability,
+close, or fresh hydration. Applications may place these values inside any
+routing, request, response, or event envelope; Chord does not prescribe that
+outer protocol.
+
 ## Tracking JSON deltas
 
 Import the standalone delta primitive from `@earendil-works/chord/delta`:
@@ -173,8 +193,12 @@ receiving host.
 
 To reload, load a candidate, pass its facets to `FacetHost.reload()`, dispose the
 candidate on failure, and dispose the retired `LoadedFacets` only after a
-successful cutover. Reload retains the host's existing shape-preservation rules.
-The bundler writes a complete temporary directory before replacing the previous
+successful cutover. The host activates and validates the candidate while the old
+providers remain routed, then replaces each singleton directly without an
+unavailable interval. Stable service handles therefore do not become disconnected
+during an ordinary reload. Keyed instances
+remain incarnation-specific and replacements receive fresh generations. The
+bundler writes a complete temporary directory before replacing the previous
 output, so loaders do not observe partially built generations.
 
 See [PLANNING.md](PLANNING.md) for the broader RPC and generation-loading

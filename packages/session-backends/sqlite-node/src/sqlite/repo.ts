@@ -101,6 +101,7 @@ function buildForkSnapshot(source: SqliteStorageSnapshot, options: ForkOptions):
 	};
 }
 
+// TODO(WP08): Remove this snapshot path when SQLite forks use streaming staging.
 function readForkSourceEntries(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -108,13 +109,14 @@ function readForkSourceEntries(
 	options: ForkOptions,
 ): Entry[] {
 	if (options.scope === "tree") return readSourceEntries(db, sessionId);
-	const mainAddress = branchTip("main");
-	const mainTip = scalarValues.find(
-		(stored) => stored.address.namespace === mainAddress.namespace && stored.address.key === mainAddress.key,
+	const sourceAddress = branchTip(options.branch);
+	const sourceTip = scalarValues.find(
+		(stored) => stored.address.namespace === sourceAddress.namespace && stored.address.key === sourceAddress.key,
 	) as StoredValue<string | null> | undefined;
-	if (mainTip === undefined) throw new Error("Source session is missing main branch");
-	const requested = options.entryId ?? mainTip.value;
-	return requested === null ? [] : scanBranchEntries(db, sessionId, { start: requested, order: "oldestFirst" });
+	if (sourceTip === undefined) throw new Error(`Unknown source branch: ${options.branch}`);
+	return sourceTip.value === null
+		? []
+		: scanBranchEntries(db, sessionId, { start: sourceTip.value, order: "oldestFirst" });
 }
 
 function createSqliteForkSnapshot(

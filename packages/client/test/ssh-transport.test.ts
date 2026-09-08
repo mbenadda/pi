@@ -2,6 +2,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseServiceCall } from "@earendil-works/chord";
 import {
 	ClientMessageDecoder,
 	encodeClientMessage,
@@ -151,7 +152,8 @@ describe.runIf(process.platform !== "win32")("createSshTransportFactory", () => 
 						continue;
 					}
 					if (message.type === "cancel") continue;
-					receivedMembers.push(`${message.call.serviceId}.${message.call.member}`);
+					const call = parseServiceCall(message.call);
+					receivedMembers.push(`${call.serviceId}.${call.member}`);
 					const frame = encodeServerMessage({ type: "response", id: message.id, ok: true, result: [] });
 					const split = Math.floor(frame.byteLength / 2);
 					socket.write(frame.subarray(0, split));

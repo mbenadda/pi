@@ -1,6 +1,15 @@
 import { createConnection, type Socket } from "node:net";
 import { isAbsolute } from "node:path";
-import { RemoteServiceError, type ServiceProviderUpdate } from "@earendil-works/chord";
+import {
+	isJsonValue,
+	type JsonValue,
+	parseServiceProviderUpdate,
+	REMOTE_SERVICE_ERROR_CODES,
+	RemoteServiceError,
+	type RemoteServiceErrorCode,
+	type ServiceCall,
+	type ServiceProviderUpdate,
+} from "@earendil-works/chord";
 import {
 	AgentHarness,
 	type AgentHarness as AgentHarnessInstance,
@@ -16,12 +25,6 @@ import {
 	withCancel,
 } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
-import {
-	ProtocolRpcCallSchema,
-	type ServiceErrorCode,
-	ServiceErrorCodeSchema,
-	ServiceProviderUpdateSchema,
-} from "@earendil-works/pi-protocol";
 import lockfile from "proper-lockfile";
 import Type, { type Static } from "typebox";
 import { Check } from "typebox/value";
@@ -38,16 +41,29 @@ import {
 } from "./process.ts";
 import {
 	createSessionWorkerServices,
-	type ServiceOperationResult,
-	ServiceOperationResultSchema,
 	type SessionWorkerRuntime,
 	type SessionWorkerServices,
+	type WorkerServiceScope,
 } from "./services/worker.ts";
 
 export type { SessionWorkerRuntime } from "./services/worker.ts";
 
 const StrictObject = <const T extends Parameters<typeof Type.Object>[0]>(properties: T) =>
 	Type.Object(properties, { additionalProperties: false });
+const OpaqueJsonValueSchema = Type.Unsafe<JsonValue>(Type.Unknown());
+const ServiceCallSchema = Type.Unsafe<ServiceCall>(
+	StrictObject({
+		serviceId: Type.String({ minLength: 1 }),
+		instance: Type.Optional(
+			StrictObject({ key: Type.String({ minLength: 1 }), generation: Type.Integer({ minimum: 1 }) }),
+		),
+		member: Type.String({ minLength: 1 }),
+		args: Type.Array(Type.Unknown()),
+	}),
+);
+const RemoteServiceErrorCodeSchema = Type.Unsafe<RemoteServiceErrorCode>(
+	Type.String({ pattern: `^(?:${REMOTE_SERVICE_ERROR_CODES.join("|")})$` }),
+);
 
 export const SESSION_WORKER_CONTROL_ADDRESS_ENV = "PI_SESSION_WORKER_CONTROL_ADDRESS";
 export const SESSION_WORKER_CONTROL_TOKEN_ENV = "PI_SESSION_WORKER_CONTROL_TOKEN";
@@ -62,7 +78,6 @@ export const SessionWorkerMetadataSchema = StrictObject({
 	path: Type.String(),
 	modifiedAt: Type.Number(),
 	parentSessionId: Type.Optional(Type.String()),
-	legacyParentSessionPath: Type.Optional(Type.String()),
 });
 
 export const SessionWorkerOptionsSchema = StrictObject({
@@ -78,13 +93,13 @@ export const WorkerOperationScopeSchema = StrictObject({
 	serverConnectionId: Type.String(),
 	attachmentId: Type.String(),
 });
-export type WorkerOperationScope = Static<typeof WorkerOperationScopeSchema>;
+export type WorkerOperationScope = WorkerServiceScope;
 
 export const WorkerOperationRequestSchema = StrictObject({
 	type: Type.Literal("operation"),
 	requestId: Type.String({ minLength: 1 }),
 	scope: WorkerOperationScopeSchema,
-	call: ProtocolRpcCallSchema,
+	call: ServiceCallSchema,
 });
 export type WorkerOperationRequest = Static<typeof WorkerOperationRequestSchema>;
 
@@ -93,13 +108,13 @@ export const WorkerOperationResponseSchema = Type.Union([
 		type: Type.Literal("operation_result"),
 		requestId: Type.String({ minLength: 1 }),
 		scope: WorkerOperationScopeSchema,
-		result: ServiceOperationResultSchema,
+		result: Type.Optional(OpaqueJsonValueSchema),
 	}),
 	StrictObject({
 		type: Type.Literal("operation_error"),
 		requestId: Type.String({ minLength: 1 }),
 		scope: WorkerOperationScopeSchema,
-		code: Type.Optional(ServiceErrorCodeSchema),
+		code: Type.Optional(RemoteServiceErrorCodeSchema),
 		message: Type.String(),
 	}),
 ]);
@@ -167,7 +182,7 @@ export const SessionWorkerEventSchema = Type.Union([
 		sessionKey: Type.String(),
 		scope: WorkerOperationScopeSchema,
 		subscriptionId: Type.String({ minLength: 1 }),
-		update: ServiceProviderUpdateSchema,
+		update: Type.Unknown(),
 	}),
 ]);
 export type SessionWorkerEvent = Static<typeof SessionWorkerEventSchema>;
@@ -441,10 +456,9 @@ function writeJsonLine(socket: Socket, message: unknown): Promise<void> {
 	});
 }
 
-function toWorkerServiceUpdate(update: ServiceProviderUpdate): Static<typeof ServiceProviderUpdateSchema> {
-	const candidate: unknown = update;
-	if (!Check(ServiceProviderUpdateSchema, candidate)) throw new Error("Service produced an invalid update");
-	return candidate;
+function toWorkerServiceUpdate(update: ServiceProviderUpdate): ServiceProviderUpdate {
+	if (!isJsonValue(update)) throw new Error("Service produced a non-JSON update");
+	return parseServiceProviderUpdate(update);
 }
 
 function demandKey(serverConnectionId: string, attachmentId: string): string {
@@ -506,7 +520,7 @@ export type CreateSessionWorkerHarness = (
 	session: Session<JsonlSessionMetadata>,
 	options: SessionWorkerOptions,
 	executionEnv: NodeExecutionEnv,
-) => Promise<AgentHarnessInstance | SessionWorkerRuntime>;
+) => Promise<SessionWorkerRuntime>;
 
 async function run(options: SessionWorkerOptions, createHarness: CreateSessionWorkerHarness): Promise<void> {
 	const { sessionDir, metadata } = options;
@@ -530,8 +544,7 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 	let services: SessionWorkerServices | undefined;
 	try {
 		session = await repo.open(metadata, TODO_CONTEXT);
-		const created = await createHarness(session, options, executionEnv);
-		const runtime: SessionWorkerRuntime = "harness" in created ? created : { harness: created };
+		const runtime = await createHarness(session, options, executionEnv);
 		harness = runtime.harness;
 		lane = runtime.lane ?? (await harness.lane("main", TODO_CONTEXT));
 		services = await createSessionWorkerServices({
@@ -618,21 +631,26 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		try {
 			releaseRequest = lifecycle!.beginRequest(request.scope.serverConnectionId, request.scope.attachmentId);
 			activeRequests.set(request.requestId, { scope: request.scope, cancel: cancellable.cancel });
-			const serviceResult = await services.invoke(request.call, request.scope, cancellable.context);
-			const result: ServiceOperationResult = serviceResult === undefined ? {} : { result: serviceResult };
+			const result = await services.invoke(request.call, request.scope, cancellable.context);
+			if (result !== undefined && !isJsonValue(result)) throw new Error("Service produced a non-JSON result");
 			await control.send({
 				type: "operation_response",
 				token,
 				sessionKey,
-				response: { type: "operation_result", requestId: request.requestId, scope: request.scope, result },
+				response: {
+					type: "operation_result",
+					requestId: request.requestId,
+					scope: request.scope,
+					...(result === undefined ? {} : { result }),
+				},
 			});
 		} catch (error) {
-			let code: ServiceErrorCode | undefined;
+			let code: RemoteServiceErrorCode | undefined;
 			if (error instanceof RemoteServiceError) {
 				code = error.code;
 			} else if (error instanceof Error && "code" in error) {
 				const candidate = error.code;
-				if (Check(ServiceErrorCodeSchema, candidate)) code = candidate;
+				if (Check(RemoteServiceErrorCodeSchema, candidate)) code = candidate;
 			}
 			await control.send({
 				type: "operation_response",

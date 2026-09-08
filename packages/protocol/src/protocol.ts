@@ -1,12 +1,11 @@
-import { isJsonValue } from "@earendil-works/chord";
-import type { WireOp } from "@earendil-works/chord/delta";
+import type { JsonValue } from "@earendil-works/chord";
 import Type, { type Static } from "typebox";
 import { Check } from "typebox/value";
-import { type JsonValue, JsonValueSchema } from "./json-value.ts";
 
 export const PROTOCOL_VERSION = 8 as const;
 
 const IdSchema = Type.String({ minLength: 1 });
+const OpaqueJsonValueSchema = Type.Unsafe<JsonValue>(Type.Unknown());
 const StrictObject = <const T extends Parameters<typeof Type.Object>[0]>(properties: T) =>
 	Type.Object(properties, { additionalProperties: false });
 
@@ -19,213 +18,11 @@ export function isServerId(value: unknown): value is ServerId {
 	return Check(ServerIdSchema, value);
 }
 
-const ServiceModeSchema = Type.Union([Type.Literal("singleton"), Type.Literal("keyed")]);
-export type ServiceMode = Static<typeof ServiceModeSchema>;
-
-const ServiceCatalogueEntrySchema = StrictObject({
-	serviceId: IdSchema,
-	mode: ServiceModeSchema,
-});
-const ServiceCatalogueSchema = Type.Array(ServiceCatalogueEntrySchema);
-export type ServiceCatalogueEntry = Static<typeof ServiceCatalogueEntrySchema>;
-
-export function parseServiceCatalogue(value: unknown): readonly ServiceCatalogueEntry[] {
-	if (!Check(ServiceCatalogueSchema, value)) throw new TypeError("Invalid service catalogue");
-	const ids = value.map(({ serviceId }) => serviceId);
-	if (new Set(ids).size !== ids.length) throw new TypeError("Service catalogue contains duplicate IDs");
-	return value;
-}
-
-const ServiceInstanceAddressSchema = StrictObject({
-	key: IdSchema,
-	generation: Type.Integer({ minimum: 1 }),
-});
-/** Contract-agnostic service/member invocation carried by the transport. */
-export const ProtocolRpcCallSchema = StrictObject({
-	serviceId: Type.String({ minLength: 1 }),
-	instance: Type.Optional(ServiceInstanceAddressSchema),
-	member: Type.String({ minLength: 1 }),
-	args: Type.Array(JsonValueSchema),
-});
-export type ProtocolRpcCall = Static<typeof ProtocolRpcCallSchema>;
-export type ProtocolRpcResult = JsonValue | undefined;
-
-const DeltaPathSegmentSchema = Type.Union([Type.String(), Type.Integer({ minimum: 0 })]);
-const DeltaPathSchema = Type.Array(DeltaPathSegmentSchema);
-const DeltaNonEmptyPathSchema = Type.Array(DeltaPathSegmentSchema, { minItems: 1 });
-const DeltaPathRefSchema = Type.Union([DeltaPathSchema, Type.Integer({ minimum: 0 })]);
-const DeltaNonEmptyPathRefSchema = Type.Union([DeltaNonEmptyPathSchema, Type.Integer({ minimum: 0 })]);
-const DeltaOpsSchema = Type.Array(
-	Type.Unsafe<WireOp>(
-		Type.Union([
-			Type.Tuple([Type.Literal("r"), JsonValueSchema]),
-			Type.Tuple([Type.Literal("#"), Type.Integer({ minimum: 0 }), DeltaPathSchema]),
-			Type.Tuple([Type.Literal("s"), DeltaNonEmptyPathRefSchema, JsonValueSchema]),
-			Type.Tuple([Type.Literal("s"), JsonValueSchema]),
-			Type.Tuple([Type.Literal("d"), DeltaNonEmptyPathRefSchema]),
-			Type.Tuple([Type.Literal("d")]),
-			Type.Tuple([Type.Literal("a"), DeltaNonEmptyPathRefSchema, Type.String()]),
-			Type.Tuple([Type.Literal("a"), Type.String()]),
-			Type.Tuple([Type.Literal("t"), DeltaNonEmptyPathRefSchema, Type.Integer({ minimum: 0 })]),
-			Type.Tuple([Type.Literal("t"), Type.Integer({ minimum: 0 })]),
-			Type.Tuple([
-				Type.Literal("p"),
-				DeltaPathRefSchema,
-				Type.Integer({ minimum: 0 }),
-				Type.Integer({ minimum: 0 }),
-				Type.Array(JsonValueSchema),
-			]),
-			Type.Tuple([
-				Type.Literal("p"),
-				Type.Integer({ minimum: 0 }),
-				Type.Integer({ minimum: 0 }),
-				Type.Array(JsonValueSchema),
-			]),
-		]),
-	),
-);
-
-const ServiceMemberSnapshotSchema = Type.Union([
-	StrictObject({
-		name: IdSchema,
-		kind: Type.Literal("method"),
-	}),
-	StrictObject({
-		name: IdSchema,
-		kind: Type.Literal("state"),
-		sequence: Type.Integer({ minimum: 0 }),
-		ops: DeltaOpsSchema,
-	}),
-]);
-const ServiceInstanceSnapshotSchema = StrictObject({
-	instance: Type.Optional(ServiceInstanceAddressSchema),
-	members: Type.Array(ServiceMemberSnapshotSchema),
-});
-const ServiceSubscriptionSnapshotSchema = StrictObject({
-	serviceId: Type.String({ minLength: 1 }),
-	mode: ServiceModeSchema,
-	instances: Type.Array(ServiceInstanceSnapshotSchema),
-});
-export type ServiceSubscriptionSnapshot = Static<typeof ServiceSubscriptionSnapshotSchema>;
-
-export function parseServiceSubscriptionSnapshot(value: unknown): ServiceSubscriptionSnapshot {
-	if (!Check(ServiceSubscriptionSnapshotSchema, value) || !isJsonValue(value)) {
-		throw new TypeError("Invalid service subscription snapshot");
-	}
-	return value;
-}
-
-export const ServiceProviderUpdateSchema = Type.Union([
-	StrictObject({
-		type: Type.Literal("state"),
-		instance: Type.Optional(ServiceInstanceAddressSchema),
-		member: IdSchema,
-		sequence: Type.Integer({ minimum: 1 }),
-		ops: DeltaOpsSchema,
-	}),
-	StrictObject({
-		type: Type.Literal("unavailable"),
-	}),
-	StrictObject({
-		type: Type.Literal("replaced"),
-		snapshot: ServiceInstanceSnapshotSchema,
-	}),
-	StrictObject({
-		type: Type.Literal("spawned"),
-		instance: ServiceInstanceSnapshotSchema,
-	}),
-	StrictObject({
-		type: Type.Literal("closed"),
-		instance: ServiceInstanceAddressSchema,
-	}),
-]);
-export type ServiceProviderUpdate = Static<typeof ServiceProviderUpdateSchema>;
-
-// TODO: check if this should be part of Chord.
-const SERVICE_CONTROL_ID = "$chord.service";
-const SERVICE_CATALOGUE_MEMBER = "catalogue";
-const SERVICE_SUBSCRIBE_MEMBER = "subscribe";
-const SERVICE_UNSUBSCRIBE_MEMBER = "unsubscribe";
-
-type ServiceControlCall =
-	| { readonly type: "catalogue" }
-	| {
-			readonly type: "subscribe";
-			readonly subscriptionId: string;
-			readonly serviceId: string;
-			readonly mode: ServiceMode;
-	  }
-	| { readonly type: "unsubscribe"; readonly subscriptionId: string };
-
-export function createServiceCatalogueCall(): ProtocolRpcCall {
-	return { serviceId: SERVICE_CONTROL_ID, member: SERVICE_CATALOGUE_MEMBER, args: [] };
-}
-
-export function createServiceSubscribeCall(
-	subscriptionId: string,
-	serviceId: string,
-	mode: ServiceMode,
-): ProtocolRpcCall {
-	return { serviceId: SERVICE_CONTROL_ID, member: SERVICE_SUBSCRIBE_MEMBER, args: [subscriptionId, serviceId, mode] };
-}
-
-export function createServiceUnsubscribeCall(subscriptionId: string): ProtocolRpcCall {
-	return { serviceId: SERVICE_CONTROL_ID, member: SERVICE_UNSUBSCRIBE_MEMBER, args: [subscriptionId] };
-}
-
-export function decodeServiceControlCall(call: ProtocolRpcCall): ServiceControlCall | undefined {
-	if (call.serviceId !== SERVICE_CONTROL_ID || call.instance !== undefined) return undefined;
-	if (call.member === SERVICE_CATALOGUE_MEMBER && call.args.length === 0) return { type: "catalogue" };
-	if (
-		call.member === SERVICE_SUBSCRIBE_MEMBER &&
-		call.args.length === 3 &&
-		typeof call.args[0] === "string" &&
-		typeof call.args[1] === "string" &&
-		(call.args[2] === "singleton" || call.args[2] === "keyed")
-	) {
-		return {
-			type: "subscribe",
-			subscriptionId: call.args[0],
-			serviceId: call.args[1],
-			mode: call.args[2],
-		};
-	}
-	if (call.member === SERVICE_UNSUBSCRIBE_MEMBER && call.args.length === 1 && typeof call.args[0] === "string") {
-		return { type: "unsubscribe", subscriptionId: call.args[0] };
-	}
-	return undefined;
-}
-
-export const ServiceErrorCodeSchema = Type.Union([
-	Type.Literal("service_not_allowed"),
-	Type.Literal("service_not_found"),
-	Type.Literal("service_mode_mismatch"),
-	Type.Literal("service_member_not_found"),
-	Type.Literal("service_member_mismatch"),
-	Type.Literal("service_instance_not_found"),
-	Type.Literal("service_stale_instance"),
-	Type.Literal("service_invalid_value"),
-]);
-export type ServiceErrorCode = Static<typeof ServiceErrorCodeSchema>;
-
-const ProtocolErrorCodeSchema = Type.Union([
-	Type.Literal("version"),
-	Type.Literal("wrong_server"),
-	Type.Literal("session_not_found"),
-	Type.Literal("session_ambiguous"),
-	Type.Literal("session_not_attached"),
-	Type.Literal("not_supported"),
-	Type.Literal("server_draining"),
-	ServiceErrorCodeSchema,
-	Type.Literal("invalid_request"),
-	Type.Literal("cancelled"),
-	Type.Literal("internal_error"),
-]);
 const ProtocolErrorSchema = StrictObject({
-	code: ProtocolErrorCodeSchema,
+	code: IdSchema,
 	message: Type.String(),
 });
-export type ProtocolErrorCode = Static<typeof ProtocolErrorCodeSchema>;
+export type ProtocolErrorCode = string;
 export type ProtocolError = Static<typeof ProtocolErrorSchema>;
 
 /** Must be the first frame sent by a client. */
@@ -253,7 +50,7 @@ const RequestEnvelopeSchema = StrictObject({
 	type: Type.Literal("request"),
 	id: IdSchema,
 	target: RpcTargetSchema,
-	call: ProtocolRpcCallSchema,
+	call: OpaqueJsonValueSchema,
 });
 const CancelEnvelopeSchema = StrictObject({
 	type: Type.Literal("cancel"),
@@ -279,7 +76,7 @@ const ResponseEnvelopeSchema = Type.Union([
 		type: Type.Literal("response"),
 		id: IdSchema,
 		ok: Type.Literal(true),
-		result: Type.Optional(JsonValueSchema),
+		result: Type.Optional(OpaqueJsonValueSchema),
 	}),
 	StrictObject({
 		type: Type.Literal("response"),
@@ -291,7 +88,7 @@ const ResponseEnvelopeSchema = Type.Union([
 const ServiceEventEnvelopeSchema = StrictObject({
 	type: Type.Literal("service_update"),
 	subscriptionId: IdSchema,
-	update: ServiceProviderUpdateSchema,
+	update: OpaqueJsonValueSchema,
 });
 /** Out-of-band update to this presentation's selected Session route. */
 const AttachmentEnvelopeSchema = StrictObject({

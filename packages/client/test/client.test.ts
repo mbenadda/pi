@@ -1,3 +1,4 @@
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
 	encodeCbor,
 	encodeFrame,
@@ -6,7 +7,13 @@ import {
 	ProtocolValidationError,
 } from "@earendil-works/pi-protocol";
 import { describe, expect, test, vi } from "vitest";
-import { type ByteTransportFactory, Client, ClientDisposedError, DisconnectedError } from "../src/index.ts";
+import {
+	type ByteTransportFactory,
+	Client,
+	ClientDisposedError,
+	createClientServiceTransport,
+	DisconnectedError,
+} from "../src/index.ts";
 import { MemoryByteServer } from "./support.ts";
 
 const serverId = "00000000-0000-4000-8000-000000000001";
@@ -76,10 +83,16 @@ describe("Client service operations", () => {
 		const client = await connectClient(server);
 		await attachClient(client, server, "session-1");
 		const target = client.attachment!;
+		const transport = createClientServiceTransport(client, () => client.attachment);
 		const updates: Array<{ readonly type: string; readonly ops?: readonly unknown[] }> = [];
-		const opening = client.subscribeService(target, "pi.models", "singleton", (update) => {
-			updates.push(update);
-		});
+		const opening = transport.subscribe(
+			"pi.models",
+			"singleton",
+			(update) => {
+				updates.push(update);
+			},
+			BACKGROUND_CONTEXT,
+		);
 		await server.waitForMessages(3);
 		expect(server.messages[2]).toMatchObject({
 			type: "request",
@@ -119,7 +132,7 @@ describe("Client service operations", () => {
 		expect(subscription.snapshot.instances[0]?.members).toEqual([
 			{ name: "state", kind: "state", sequence: 0, ops: [["r", { revision: 0 }]] },
 		]);
-		subscription.start();
+		subscription.activate();
 		await vi.waitFor(() => expect(updates.map(({ type }) => type)).toEqual(["state"]));
 		server.send({
 			type: "service_update",
@@ -142,7 +155,7 @@ describe("Client service operations", () => {
 		await vi.waitFor(() => expect(updates).toHaveLength(3));
 		expect(updates[2]?.ops).toEqual([["s", ["revision"], 3]]);
 
-		const disposing = subscription.dispose();
+		const disposing = subscription.close(BACKGROUND_CONTEXT);
 		await server.waitForMessages(4);
 		expect(server.messages[3]).toMatchObject({
 			call: { serviceId: "$chord.service", member: "unsubscribe", args: ["service-1"] },

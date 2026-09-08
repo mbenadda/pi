@@ -1,13 +1,7 @@
 import { isJsonValue } from "@earendil-works/chord";
 import { Check } from "typebox/value";
 import { decodeCbor, encodeCbor } from "./cbor/index.ts";
-import {
-	assertCompleteFrame,
-	DEFAULT_MAX_FRAME_LENGTH,
-	encodeFrame,
-	FrameDecoder,
-	type FrameDecoderOptions,
-} from "./framing.ts";
+import { DEFAULT_MAX_FRAME_LENGTH, encodeFrame, FrameDecoder, type FrameDecoderOptions } from "./framing.ts";
 import {
 	type ClientMessage,
 	ClientMessageSchema,
@@ -51,9 +45,7 @@ function encodeProtocolMessage<T>(
 	const validated = parse(value);
 	try {
 		const maxFrameLength = options?.maxFrameLength ?? DEFAULT_MAX_FRAME_LENGTH;
-		const frame = encodeFrame(encodeCbor(validated, { maxByteLength: maxFrameLength }));
-		assertCompleteFrame(frame, { maxFrameLength });
-		return frame;
+		return encodeFrame(encodeCbor(validated, { maxByteLength: maxFrameLength }));
 	} catch (error) {
 		if (error instanceof ProtocolValidationError) throw error;
 		throw new ProtocolValidationError(`Unable to encode ${kind} protocol message: ${boundedErrorMessage(error)}`);

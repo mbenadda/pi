@@ -1,5 +1,4 @@
-import { type Context, defineService } from "@earendil-works/chord";
-import type { JsonValue } from "@earendil-works/pi-protocol";
+import { type Context, defineService, type JsonValue } from "@earendil-works/chord";
 
 /** Server-built plugin generations available to presentations. */
 export interface PresentationPlugins {

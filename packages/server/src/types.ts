@@ -1,6 +1,5 @@
-import type { ServiceProviderUpdate } from "@earendil-works/chord";
+import type { JsonValue, ServiceCall, ServiceProviderUpdate } from "@earendil-works/chord";
 import type { Context, SessionMetadata } from "@earendil-works/pi-agent-core";
-import type { ProtocolRpcCall, ProtocolRpcResult } from "@earendil-works/pi-protocol";
 import type { ServerListener } from "./listener.ts";
 
 export interface ServerOptions {
@@ -18,11 +17,11 @@ export type MaybePromise<T> = T | Promise<T>;
 /** One presentation connection's live capability for a hosted Session. */
 export interface RoutedSessionAttachment {
 	/** Route one contract-agnostic service operation to the attached Session endpoint. */
-	invokeService?(
-		call: ProtocolRpcCall,
+	invokeService(
+		call: ServiceCall,
 		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => MaybePromise<void>,
 		context: Context,
-	): Promise<ProtocolRpcResult>;
+	): Promise<JsonValue | undefined>;
 	release(context: Context): MaybePromise<void>;
 }
 
@@ -37,10 +36,10 @@ export interface RoutedServerPresentation {
 /** One connection's server-scoped service endpoint. */
 export interface RoutedServerServiceAttachment {
 	invokeService(
-		call: ProtocolRpcCall,
+		call: ServiceCall,
 		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => MaybePromise<void>,
 		context: Context,
-	): Promise<ProtocolRpcResult>;
+	): Promise<JsonValue | undefined>;
 	release(context: Context): MaybePromise<void>;
 }
 

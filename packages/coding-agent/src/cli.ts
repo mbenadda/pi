@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { basename } from "node:path";
-import { APP_NAME } from "./config.ts";
-import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
+import { setupCli } from "./cli/setup.ts";
 import { runPiw } from "./experimental/piw.ts";
 import { consumeInternalProcessRole } from "./experimental/process.ts";
 import { runServerProcess } from "./experimental/server.ts";
@@ -23,14 +22,7 @@ if (internalProcessRole === "server") {
 	if (internalProcessRole !== undefined) {
 		throw new Error(`Internal ${internalProcessRole} process must use its lightweight entrypoint`);
 	}
-	process.title = APP_NAME;
-	process.env.PI_CODING_AGENT = "true";
-	process.env.AI_AGENT = "pi";
-	process.emitWarning = (() => {}) as typeof process.emitWarning;
-
-	// Configure undici's global dispatcher before provider SDKs issue requests.
-	// Runtime settings are applied once SettingsManager has loaded global/project settings.
-	configureHttpDispatcher();
+	setupCli();
 
 	if (basename(process.execPath) === "piw" || basename(process.argv[1] ?? "") === "piw") {
 		void runPiw(process.argv.slice(2));

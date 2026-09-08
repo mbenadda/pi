@@ -129,8 +129,7 @@ export class SqliteStorage implements Storage {
 		return Promise.resolve(readSessionStats(this.db, this.sessionId));
 	}
 
-	snapshot(options: ForkOptions | undefined, _context: Context): Promise<SqliteStorageSnapshot> {
-		options ??= {};
+	snapshot(options: ForkOptions, _context: Context): Promise<SqliteStorageSnapshot> {
 		if (this.state !== "open") return Promise.reject(new Error("SqliteStorage is closed"));
 		const result = this.commitQueue.then(() => this.readSnapshot(options));
 		this.commitQueue = result.then(
@@ -151,15 +150,14 @@ export class SqliteStorage implements Storage {
 
 	private readSnapshotEntries(options: ForkOptions, scalarValues: readonly StoredValue<unknown>[]): Entry[] {
 		if (options.scope === "tree") return readAllEntryRows(this.db, this.sessionId).map(decodeEntryRow);
-		const mainAddress = branchTip("main");
-		const mainTip = scalarValues.find(
-			(stored) => stored.address.namespace === mainAddress.namespace && stored.address.key === mainAddress.key,
+		const sourceAddress = branchTip(options.branch);
+		const sourceTip = scalarValues.find(
+			(stored) => stored.address.namespace === sourceAddress.namespace && stored.address.key === sourceAddress.key,
 		) as StoredValue<string | null> | undefined;
-		if (mainTip === undefined) throw new Error("Source session is missing main branch");
-		const requested = options.entryId ?? mainTip.value;
-		return requested === null
+		if (sourceTip === undefined) throw new Error(`Unknown source branch: ${options.branch}`);
+		return sourceTip.value === null
 			? []
-			: scanBranchEntries(this.db, this.sessionId, { start: requested, order: "oldestFirst" });
+			: scanBranchEntries(this.db, this.sessionId, { start: sourceTip.value, order: "oldestFirst" });
 	}
 
 	private applyCommit(writes: Write[]): CommitResult {

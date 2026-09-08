@@ -3,15 +3,7 @@ import {
 	type ClientHello,
 	type ClientMessage,
 	ClientMessageDecoder,
-	createServiceCatalogueCall,
-	createServiceStateDecoder,
-	createServiceStateEncoder,
-	createServiceSubscribeCall,
-	createServiceUnsubscribeCall,
-	type DecodedServiceProviderUpdate,
-	type DecodedServiceSubscriptionSnapshot,
 	decodeCbor,
-	decodeServiceControlCall,
 	encodeCbor,
 	encodeClientMessage,
 	encodeFrame,
@@ -22,8 +14,6 @@ import {
 	ProtocolValidationError,
 	parseClientMessage,
 	parseServerMessage,
-	parseServiceCatalogue,
-	parseServiceSubscriptionSnapshot,
 	type ServerHello,
 	type ServerMessage,
 	ServerMessageDecoder,
@@ -68,237 +58,14 @@ describe("protocol validation", () => {
 			parseClientMessage({
 				type: "request",
 				id: "request-1",
-				serverId,
-				call: { method: "list", args: [] },
+				target: { serverId },
+				call: { serviceId: "pi.models", member: "list", args: [] },
 			}),
 		).toThrow(ProtocolValidationError);
 	});
 
-	test("encodes service control and keyed instance addresses", () => {
-		expect(decodeServiceControlCall(createServiceCatalogueCall())).toEqual({ type: "catalogue" });
-		expect(
-			parseServiceCatalogue([
-				{ serviceId: "pi.models", mode: "singleton" },
-				{ serviceId: "pi.dialogs", mode: "keyed" },
-			]),
-		).toEqual([
-			{ serviceId: "pi.models", mode: "singleton" },
-			{ serviceId: "pi.dialogs", mode: "keyed" },
-		]);
-		const subscribe = createServiceSubscribeCall("subscription-1", "pi.models", "singleton");
-		expect(decodeServiceControlCall(subscribe)).toEqual({
-			type: "subscribe",
-			subscriptionId: "subscription-1",
-			serviceId: "pi.models",
-			mode: "singleton",
-		});
-		expect(decodeServiceControlCall(createServiceUnsubscribeCall("subscription-1"))).toEqual({
-			type: "unsubscribe",
-			subscriptionId: "subscription-1",
-		});
-		expect(
-			parseServiceSubscriptionSnapshot({
-				serviceId: "pi.models",
-				mode: "singleton",
-				instances: [
-					{
-						members: [{ name: "state", kind: "state", sequence: 0, ops: [["r", { revision: 1 }]] }],
-					},
-				],
-			}),
-		).toEqual({
-			serviceId: "pi.models",
-			mode: "singleton",
-			instances: [
-				{
-					members: [{ name: "state", kind: "state", sequence: 0, ops: [["r", { revision: 1 }]] }],
-				},
-			],
-		});
-		expect(
-			parseServerMessage({
-				type: "service_update",
-				subscriptionId: "subscription-1",
-				update: {
-					type: "state",
-					member: "state",
-					sequence: 1,
-					ops: [["s", ["revision"], 2]],
-				},
-			}),
-		).toMatchObject({ update: { type: "state", member: "state" } });
-		expect(
-			parseServerMessage({
-				type: "service_update",
-				subscriptionId: "subscription-1",
-				update: { type: "unavailable" },
-			}),
-		).toMatchObject({ update: { type: "unavailable" } });
-		expect(
-			parseServerMessage({
-				type: "service_update",
-				subscriptionId: "subscription-1",
-				update: {
-					type: "replaced",
-					snapshot: { members: [{ name: "select", kind: "method" }] },
-				},
-			}),
-		).toMatchObject({ update: { type: "replaced", snapshot: { members: [{ name: "select" }] } } });
-		const keyed: ClientMessage = {
-			type: "request",
-			id: "request-1",
-			target: {
-				serverId: "00000000-0000-4000-8000-000000000001",
-				sessionId: "session-1",
-				attachmentId: "attachment-1",
-			},
-			call: {
-				serviceId: "pi.question-dialog",
-				instance: { key: "invocation-1", generation: 2 },
-				member: "submit",
-				args: [{ outcome: "selected", index: 0 }],
-			},
-		};
-		expect(parseClientMessage(keyed)).toEqual(keyed);
-	});
-
-	test("keeps one operation codec pair for one subscription state", () => {
-		const enc = createServiceStateEncoder();
-		const dec = createServiceStateDecoder();
-		const snapshot: DecodedServiceSubscriptionSnapshot = {
-			serviceId: "pi.models",
-			mode: "singleton",
-			instances: [
-				{
-					members: [{ name: "state", kind: "state", sequence: 0, ops: [["r", { revision: 0 }]] }],
-				},
-			],
-		};
-		expect(dec.decodeSnapshot(enc.encodeSnapshot(snapshot))).toEqual(snapshot);
-
-		const first: DecodedServiceProviderUpdate = {
-			type: "state",
-			member: "state",
-			sequence: 1,
-			ops: [["s", ["revision"], 1]],
-		};
-		const second: DecodedServiceProviderUpdate = {
-			type: "state",
-			member: "state",
-			sequence: 2,
-			ops: [["s", ["revision"], 2]],
-		};
-		const firstWire = enc.encodeUpdate(first);
-		const secondWire = enc.encodeUpdate(second);
-		expect(firstWire).toMatchObject({ ops: [["s", ["revision"], 1]] });
-		expect(secondWire).toMatchObject({
-			ops: [
-				["#", 0, ["revision"]],
-				["s", 0, 2],
-			],
-		});
-		expect(dec.decodeUpdate(firstWire)).toEqual(first);
-		expect(dec.decodeUpdate(secondWire)).toEqual(second);
-	});
-
-	test("isolates operation dictionaries between states and subscriptions", () => {
-		const snapshot: DecodedServiceSubscriptionSnapshot = {
-			serviceId: "pi.states",
-			mode: "singleton",
-			instances: [
-				{
-					members: [
-						{ name: "left", kind: "state", sequence: 0, ops: [["r", { revision: 0 }]] },
-						{ name: "right", kind: "state", sequence: 0, ops: [["r", { revision: 0 }]] },
-					],
-				},
-			],
-		};
-		const firstEncoder = createServiceStateEncoder();
-		const firstDecoder = createServiceStateDecoder();
-		const secondEncoder = createServiceStateEncoder();
-		const secondDecoder = createServiceStateDecoder();
-		firstDecoder.decodeSnapshot(firstEncoder.encodeSnapshot(snapshot));
-		secondDecoder.decodeSnapshot(secondEncoder.encodeSnapshot(snapshot));
-
-		const update = (member: string, sequence: number, revision: number): DecodedServiceProviderUpdate => ({
-			type: "state",
-			member,
-			sequence,
-			ops: [["s", ["revision"], revision]],
-		});
-		const firstLeft = firstEncoder.encodeUpdate(update("left", 1, 1));
-		const firstRight = firstEncoder.encodeUpdate(update("right", 1, 1));
-		const secondLeft = firstEncoder.encodeUpdate(update("left", 2, 2));
-		const secondRight = firstEncoder.encodeUpdate(update("right", 2, 2));
-		expect(firstLeft).toMatchObject({ ops: [["s", ["revision"], 1]] });
-		expect(firstRight).toMatchObject({ ops: [["s", ["revision"], 1]] });
-		expect(secondLeft).toMatchObject({
-			ops: [
-				["#", 0, ["revision"]],
-				["s", 0, 2],
-			],
-		});
-		expect(secondRight).toMatchObject({
-			ops: [
-				["#", 0, ["revision"]],
-				["s", 0, 2],
-			],
-		});
-		expect(firstDecoder.decodeUpdate(firstLeft)).toEqual(update("left", 1, 1));
-		expect(firstDecoder.decodeUpdate(firstRight)).toEqual(update("right", 1, 1));
-		expect(firstDecoder.decodeUpdate(secondLeft)).toEqual(update("left", 2, 2));
-		expect(firstDecoder.decodeUpdate(secondRight)).toEqual(update("right", 2, 2));
-
-		const independentLeft = secondEncoder.encodeUpdate(update("left", 1, 1));
-		expect(independentLeft).toMatchObject({ ops: [["s", ["revision"], 1]] });
-		expect(secondDecoder.decodeUpdate(independentLeft)).toEqual(update("left", 1, 1));
-
-		const leftBase: DecodedServiceProviderUpdate = {
-			type: "state",
-			member: "left",
-			sequence: 3,
-			ops: [["r", { revision: 3 }]],
-		};
-		expect(firstDecoder.decodeUpdate(firstEncoder.encodeUpdate(leftBase))).toEqual(leftBase);
-		const thirdRight = firstEncoder.encodeUpdate(update("right", 3, 3));
-		expect(thirdRight).toMatchObject({ ops: [["s", 0, 3]] });
-		expect(firstDecoder.decodeUpdate(thirdRight)).toEqual(update("right", 3, 3));
-	});
-
-	test("creates and removes keyed instance codecs with their lifecycle", () => {
-		const enc = createServiceStateEncoder();
-		const dec = createServiceStateDecoder();
-		const snapshot: DecodedServiceSubscriptionSnapshot = {
-			serviceId: "pi.dialogs",
-			mode: "keyed",
-			instances: [],
-		};
-		expect(dec.decodeSnapshot(enc.encodeSnapshot(snapshot))).toEqual(snapshot);
-		const address = { key: "dialog-1", generation: 1 };
-		const spawned: DecodedServiceProviderUpdate = {
-			type: "spawned",
-			instance: {
-				instance: address,
-				members: [{ name: "request", kind: "state", sequence: 0, ops: [["r", { value: 0 }]] }],
-			},
-		};
-		expect(dec.decodeUpdate(enc.encodeUpdate(spawned))).toEqual(spawned);
-		const update: DecodedServiceProviderUpdate = {
-			type: "state",
-			instance: address,
-			member: "request",
-			sequence: 1,
-			ops: [["s", ["value"], 1]],
-		};
-		expect(dec.decodeUpdate(enc.encodeUpdate(update))).toEqual(update);
-		const closed: DecodedServiceProviderUpdate = { type: "closed", instance: address };
-		expect(dec.decodeUpdate(enc.encodeUpdate(closed))).toEqual(closed);
-		expect(() => enc.encodeUpdate({ ...update, sequence: 2 })).toThrow("Unknown service state");
-	});
-
-	test("keeps transport RPC payloads opaque while validating their envelope", () => {
-		const message: ClientMessage = {
+	test("keeps routed request and event payloads opaque", () => {
+		const request: ClientMessage = {
 			type: "request",
 			id: "request-1",
 			target: {
@@ -308,14 +75,28 @@ describe("protocol validation", () => {
 			},
 			call: {
 				serviceId: "application.custom",
+				instance: { key: "instance-1", generation: 2 },
 				member: "invoke",
 				args: [{ arbitrary: true }, ["opaque"]],
 			},
 		};
-		expect(parseClientMessage(message)).toEqual(message);
+		expect(parseClientMessage(request)).toEqual(request);
+		expect(
+			parseClientMessage({
+				...request,
+				call: { arbitrary: "strict JSON whose service meaning belongs to Chord" },
+			}),
+		).toMatchObject({ call: { arbitrary: expect.any(String) } });
+		expect(
+			parseServerMessage({
+				type: "service_update",
+				subscriptionId: "subscription-1",
+				update: { applicationDefined: true },
+			}),
+		).toMatchObject({ update: { applicationDefined: true } });
 	});
 
-	test("rejects non-JSON opaque service payloads", () => {
+	test("rejects non-JSON opaque payloads", () => {
 		const request = {
 			type: "request",
 			id: "request-1",
@@ -374,17 +155,18 @@ describe("protocol validation", () => {
 			{
 				type: "request",
 				id: "",
-				serverId: "00000000-0000-4000-8000-000000000001",
-				call: { method: "list", args: [] },
+				target: { serverId: "00000000-0000-4000-8000-000000000001" },
+				call: { serviceId: "pi.models", member: "list", args: [] },
 			},
 		],
 		[
-			"extra call field",
+			"extra envelope field",
 			{
 				type: "request",
 				id: "request-1",
-				serverId: "00000000-0000-4000-8000-000000000001",
-				call: { method: "list", args: [], extra: true },
+				target: { serverId: "00000000-0000-4000-8000-000000000001" },
+				call: { serviceId: "pi.models", member: "list", args: [] },
+				extra: true,
 			},
 		],
 	] as const)("rejects malformed request boundaries: %s", (_label, message) => {
@@ -402,27 +184,23 @@ describe("protocol validation", () => {
 	test.each([
 		["invalid server id", { ...serverHello, serverId: "server-1" }],
 		["extra response field", { type: "response", id: "request-1", ok: true, result: [], extra: true }],
+		["empty error code", { type: "response", id: "request-1", ok: false, error: { code: "", message: "bad" } }],
 	] as const)("rejects malformed server boundaries: %s", (_label, message) => {
 		expect(() => parseServerMessage(message)).toThrow(ProtocolValidationError);
 	});
 
-	test.each([
-		"wrong_server",
-		"session_not_found",
-		"session_not_attached",
-		"not_supported",
-		"server_draining",
-		"cancelled",
-		"internal_error",
-	] as const)("accepts the %s error code", (code) => {
-		const message: ServerMessage = {
-			type: "response",
-			id: "request-1",
-			ok: false,
-			error: { code, message: "safe" },
-		};
-		expect(parseServerMessage(message)).toEqual(message);
-	});
+	test.each(["wrong_server", "cancelled", "service_not_found", "application_error"] as const)(
+		"accepts the opaque %s error code",
+		(code) => {
+			const message: ServerMessage = {
+				type: "response",
+				id: "request-1",
+				ok: false,
+				error: { code, message: "safe" },
+			};
+			expect(parseServerMessage(message)).toEqual(message);
+		},
+	);
 
 	test("rejects unknown messages and fields", () => {
 		expect(() => parseServerMessage({ ...serverHello, snapshot: {} })).toThrow(ProtocolValidationError);

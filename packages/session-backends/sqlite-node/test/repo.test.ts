@@ -8,6 +8,17 @@ import { describe, expect, it } from "vitest";
 import type { SqliteDatabase, SqliteDatabaseFactory, SqliteStatement } from "../src/index.ts";
 import { createNodeSqliteFactory, SqliteSessionRepo, sql } from "../src/index.ts";
 
+const TEST_LANE_CONFIGURATION = {
+	model: { provider: "test", modelId: "test" },
+	thinkingLevel: "off",
+	activeToolNames: [],
+} satisfies storedValues.LaneConfiguration;
+const IDLE_LANE_STATE = {
+	currentOperationId: null,
+	lastOperationId: null,
+	inbox: [],
+} satisfies storedValues.LaneState;
+
 async function withTempDir<T>(run: (directory: string) => Promise<T>): Promise<T> {
 	const directory = await mkdtemp(join(tmpdir(), "pi-sqlite-session-"));
 	try {
@@ -202,23 +213,23 @@ function commitLaterSourceState(db: SqliteDatabase): void {
 	const label = storedValues.entryLabel("root");
 	db.transaction(() => {
 		sql`INSERT INTO entries (session_id, id, parent_id, seq, type, custom_type, timestamp, payload)
-			VALUES (${"source"}, ${"child"}, ${"root"}, ${5}, ${"message"}, ${null}, ${2}, ${JSON.stringify({ message: { role: "user", content: "after", timestamp: 2 } })})`.run(
+			VALUES (${"source"}, ${"child"}, ${"root"}, ${7}, ${"message"}, ${null}, ${2}, ${JSON.stringify({ message: { role: "user", content: "after", timestamp: 2 } })})`.run(
 			db,
 		);
 		sql`INSERT INTO branch_entries (session_id, branch_id, entry_id, entry_seq, entry_type)
-			VALUES (${"source"}, ${"root"}, ${"child"}, ${5}, ${"message"})`.run(db);
-		sql`UPDATE branch_meta SET tip_entry_id = ${"child"}, tip_seq = ${5}
+			VALUES (${"source"}, ${"root"}, ${"child"}, ${7}, ${"message"})`.run(db);
+		sql`UPDATE branch_meta SET tip_entry_id = ${"child"}, tip_seq = ${7}
 			WHERE session_id = ${"source"} AND branch_id = ${"root"}`.run(db);
 		for (const [namespace, key, seq, value] of [
-			[tip.namespace, tip.key, 6, "child"],
-			[name.namespace, name.key, 7, "after"],
-			[label.namespace, label.key, 8, "after-label"],
+			[tip.namespace, tip.key, 8, "child"],
+			[name.namespace, name.key, 9, "after"],
+			[label.namespace, label.key, 10, "after-label"],
 		] as const) {
 			sql`INSERT INTO scalar_values (session_id, namespace, key, seq, value)
 				VALUES (${"source"}, ${namespace}, ${key}, ${seq}, ${JSON.stringify(value)})
 				ON CONFLICT(session_id, namespace, key) DO UPDATE SET seq = excluded.seq, value = excluded.value`.run(db);
 		}
-		sql`UPDATE sessions SET message_count = ${1}, next_seq = ${9} WHERE id = ${"source"}`.run(db);
+		sql`UPDATE sessions SET message_count = ${1}, next_seq = ${11} WHERE id = ${"source"}`.run(db);
 	});
 }
 
@@ -558,6 +569,8 @@ describe("SqliteSessionRepo", () => {
 								message: { role: "user", content: "child", timestamp: 1 },
 							}),
 							storedValues.setValue(storedValues.branchTip("main"), "child"),
+							storedValues.setValue(storedValues.laneConfig("main"), TEST_LANE_CONFIGURATION),
+							storedValues.setValue(storedValues.laneState("main"), IDLE_LANE_STATE),
 							sessionWrites.insertUsage({
 								id: "usage",
 								adjustment: false,
@@ -577,7 +590,11 @@ describe("SqliteSessionRepo", () => {
 			);
 
 			await source.close(BACKGROUND_CONTEXT);
-			const fork = await repo.fork(source.metadata, { id: "fork", entryId: "child" }, BACKGROUND_CONTEXT);
+			const fork = await repo.fork(
+				source.metadata,
+				{ id: "fork", scope: "branch", branch: "main", entryId: "child" },
+				BACKGROUND_CONTEXT,
+			);
 
 			await withDb(fork.metadata.path, (db) => {
 				expect(
@@ -752,6 +769,8 @@ describe("SqliteSessionRepo", () => {
 						[
 							sessionWrites.insertEntry({ id: "left-root", parentId: null, type: "custom", customType: "left" }),
 							storedValues.setValue(storedValues.branchTip("main"), "left-root"),
+							storedValues.setValue(storedValues.laneConfig("main"), TEST_LANE_CONFIGURATION),
+							storedValues.setValue(storedValues.laneState("main"), IDLE_LANE_STATE),
 							storedValues.setValue(storedValues.sessionName, "left"),
 						],
 						BACKGROUND_CONTEXT,
@@ -776,7 +795,11 @@ describe("SqliteSessionRepo", () => {
 				BACKGROUND_CONTEXT,
 			);
 
-			const fork = await rightRepo.fork(left.metadata, { id: "fork-left" }, BACKGROUND_CONTEXT);
+			const fork = await rightRepo.fork(
+				left.metadata,
+				{ id: "fork-left", scope: "branch", branch: "main" },
+				BACKGROUND_CONTEXT,
+			);
 			expect((await fork.findEntries({ order: "asc" }, BACKGROUND_CONTEXT)).map(({ id }) => id)).toEqual([
 				"left-root",
 			]);
@@ -805,6 +828,8 @@ describe("SqliteSessionRepo", () => {
 							[
 								sessionWrites.insertEntry({ id: "root", parentId: null, type: "custom", customType: "root" }),
 								storedValues.setValue(storedValues.branchTip("main"), "root"),
+								storedValues.setValue(storedValues.laneConfig("main"), TEST_LANE_CONFIGURATION),
+								storedValues.setValue(storedValues.laneState("main"), IDLE_LANE_STATE),
 								storedValues.setValue(storedValues.sessionName, "before"),
 								storedValues.setValue(storedValues.entryLabel("root"), "before-label"),
 							],
@@ -827,7 +852,11 @@ describe("SqliteSessionRepo", () => {
 					now: () => 2,
 				});
 
-				const first = await serverRepo.fork(source.metadata, { id: "first-fork" }, BACKGROUND_CONTEXT);
+				const first = await serverRepo.fork(
+					source.metadata,
+					{ id: "first-fork", scope: "branch", branch: "main" },
+					BACKGROUND_CONTEXT,
+				);
 
 				expect(laterCommitCompleted).toBe(true);
 				expect(databaseFactory.readOnlyOpenCount).toBe(1);
@@ -841,7 +870,11 @@ describe("SqliteSessionRepo", () => {
 				);
 				expect((await first.getStats(BACKGROUND_CONTEXT)).messageCount).toBe(0);
 
-				const second = await serverRepo.fork(source.metadata, { id: "second-fork" }, BACKGROUND_CONTEXT);
+				const second = await serverRepo.fork(
+					source.metadata,
+					{ id: "second-fork", scope: "branch", branch: "main" },
+					BACKGROUND_CONTEXT,
+				);
 				expect(databaseFactory.readOnlyOpenCount).toBe(2);
 				expect((await second.findEntries({ order: "asc" }, BACKGROUND_CONTEXT)).map(({ id }) => id)).toEqual([
 					"root",

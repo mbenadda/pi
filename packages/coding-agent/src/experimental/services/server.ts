@@ -1,6 +1,11 @@
-import { type Context, RemoteServiceProvider, replicatedState, type ServiceSubscription } from "@earendil-works/chord";
+import {
+	type Context,
+	createRemoteServiceEndpoint,
+	type JsonValue,
+	RemoteServiceProvider,
+	replicatedState,
+} from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { decodeServiceControlCall, type JsonValue } from "@earendil-works/pi-protocol";
 import type { RoutedServerServiceAttachment, RoutedServerServiceHost } from "@earendil-works/pi-server";
 import { PresentationPlugins } from "./plugins.ts";
 import {
@@ -127,44 +132,19 @@ function createProviderAttachment(
 	provider: RemoteServiceProvider,
 	onRelease: () => void,
 ): RoutedServerServiceAttachment {
-	const subscriptions = new Map<string, ServiceSubscription>();
+	const endpoint = createRemoteServiceEndpoint(provider);
 	let released = false;
 	return {
-		async invokeService(call, publish, context) {
-			if (released) throw new Error("Server service attachment is released");
-			const control = decodeServiceControlCall(call);
-			if (control?.type === "catalogue") return toProtocolJson(provider.catalogue);
-			if (control?.type === "subscribe") {
-				if (subscriptions.has(control.subscriptionId)) {
-					throw new Error("Service subscription ID is already active");
-				}
-				const subscription = provider.subscribe(control.serviceId, control.mode, (update, updateContext) => {
-					void Promise.resolve(publish(control.subscriptionId, update, updateContext)).catch(() => {});
-				});
-				subscriptions.set(control.subscriptionId, subscription);
-				subscription.activate();
-				return toProtocolJson(subscription.snapshot);
-			}
-			if (control?.type === "unsubscribe") {
-				const subscription = subscriptions.get(control.subscriptionId);
-				if (subscription === undefined) throw new Error("Service subscription was not found");
-				subscription.close();
-				subscriptions.delete(control.subscriptionId);
-				return undefined;
-			}
-			return provider.invoke(call, context);
+		invokeService(call, publish, context) {
+			if (released) return Promise.reject(new Error("Server service attachment is released"));
+			return endpoint.invoke(call, publish, context);
 		},
 		release() {
 			if (released) return;
 			released = true;
-			for (const subscription of subscriptions.values()) subscription.close();
-			subscriptions.clear();
+			endpoint.dispose();
 			provider.dispose();
 			onRelease();
 		},
 	};
-}
-
-function toProtocolJson(value: unknown): JsonValue {
-	return value as JsonValue;
 }

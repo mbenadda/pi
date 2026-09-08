@@ -12,10 +12,12 @@ import { activateBuiltinClientServices, openClientRuntime } from "../src/experim
 import { createPresentationFacetLoaders } from "../src/experimental/plugins/bundled.ts";
 import * as processRuntime from "../src/experimental/process.ts";
 import { type RunningServer, startServer } from "../src/experimental/server.ts";
+import { AgentController } from "../src/experimental/services/agent-controller.ts";
 import { createSessionServiceSource, type SessionAttachmentState } from "../src/experimental/services/connection.ts";
 import { Models } from "../src/experimental/services/models.ts";
-import { PresentationPlugins } from "../src/experimental/services/plugins.ts";
+import { PresentationPlugins, SessionPlugins } from "../src/experimental/services/plugins.ts";
 import { SessionDirectory, SessionManagement } from "../src/experimental/services/sessions.ts";
+import { Transcript } from "../src/experimental/services/transcript.ts";
 import { createServerServiceBinding, createSessionServiceBinding } from "./experimental-service-binding.ts";
 import {
 	configureExperimentalWorkerModel,
@@ -638,6 +640,40 @@ describe("experimental durable server composition", () => {
 				"run_end",
 			]),
 		);
+	});
+
+	test("replicates terminal operation state after consecutive prompts", async ({ onTestFinished }) => {
+		const spawn = vi
+			.spyOn(processRuntime, "spawnInternalProcess")
+			.mockImplementation((role, args, options) =>
+				realSpawnInternalProcess(
+					role,
+					args,
+					role === "session-worker" ? { ...options, entryUrl: fauxWorkerEntryUrl } : options,
+				),
+			);
+		onTestFinished(() => spawn.mockRestore());
+		const { runtime } = await makeServer();
+		const client = await attachClient(runtime, "demo-1");
+		const services = createSessionServiceBinding(client, { services: [AgentController, SessionPlugins, Transcript] });
+		const controller = services.use(AgentController);
+		const transcript = services.use(Transcript);
+		await services.ready(BACKGROUND_CONTEXT);
+		await services.use(SessionPlugins).reload(BACKGROUND_CONTEXT);
+		try {
+			for (const message of ["first question", "second question"]) {
+				const response = await controller.prompt({ message, images: null }, BACKGROUND_CONTEXT);
+				expect(response).toMatchObject({ accepted: true, operationId: expect.any(String) });
+				await vi.waitFor(() => {
+					expect(transcript.state.value?.snapshot).toMatchObject({
+						operation: null,
+						lastResult: { operationId: response.operationId },
+					});
+				});
+			}
+		} finally {
+			await services.dispose(BACKGROUND_CONTEXT);
+		}
 	});
 
 	test("stops an idle Session worker after its client disconnects", async () => {

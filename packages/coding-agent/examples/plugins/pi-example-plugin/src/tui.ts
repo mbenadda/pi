@@ -11,14 +11,17 @@ export default defineFacet({
 		const ui = env.use(PresentationUI);
 		env.onActivate(() => {
 			env.own(
-				commands.register({
+				commands.replace({
 					name: "hello",
 					description: "Call the bundled Session worker facet",
 					argumentHint: "<name>",
 					async run(args, context) {
 						const message = args.length === 0 ? "from the TUI" : args;
 						const reply = await example.greet({ name: message }, context);
-						ui.showStatus(`${reply.message} Worker activations: ${reply.workerActivations}.`, context);
+						ui.showStatus(
+							`We got this: ${reply.message} Worker activations: ${reply.workerActivations}.`,
+							context,
+						);
 						return controller.prompt({ message: `pong: ${message}`, images: null }, context);
 					},
 				}),

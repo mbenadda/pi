@@ -1,27 +1,22 @@
+import { type Decoder, decoder, type Encoder, encoder } from "../delta/index.ts";
 import type {
-	ServiceInstanceSnapshot as DecodedServiceInstanceSnapshot,
-	ServiceProviderUpdate as DecodedServiceProviderUpdate,
-	ServiceSubscriptionSnapshot as DecodedServiceSubscriptionSnapshot,
 	ServiceInstanceAddress,
-} from "@earendil-works/chord";
-import { type Decoder, decoder, type Encoder, encoder } from "@earendil-works/chord/delta";
-import type {
-	ServiceProviderUpdate as WireServiceProviderUpdate,
-	ServiceSubscriptionSnapshot as WireServiceSubscriptionSnapshot,
-} from "./protocol.ts";
+	ServiceInstanceSnapshot,
+	ServiceProviderUpdate,
+	ServiceSubscriptionSnapshot,
+} from "../types.ts";
+import type { WireServiceProviderUpdate, WireServiceSubscriptionSnapshot } from "./wire.ts";
 
-export type { DecodedServiceProviderUpdate, DecodedServiceSubscriptionSnapshot };
-
-/** Stateful operation encoders for every state in one service subscription. */
+/** Stateful operation encoders for every replicated state in one service subscription. */
 export interface ServiceStateEncoder {
-	encodeSnapshot(snapshot: DecodedServiceSubscriptionSnapshot): WireServiceSubscriptionSnapshot;
-	encodeUpdate(update: DecodedServiceProviderUpdate): WireServiceProviderUpdate;
+	encodeSnapshot(snapshot: ServiceSubscriptionSnapshot): WireServiceSubscriptionSnapshot;
+	encodeUpdate(update: ServiceProviderUpdate): WireServiceProviderUpdate;
 }
 
-/** Stateful operation decoders for every state in one service subscription. */
+/** Stateful operation decoders for every replicated state in one service subscription. */
 export interface ServiceStateDecoder {
-	decodeSnapshot(snapshot: WireServiceSubscriptionSnapshot): DecodedServiceSubscriptionSnapshot;
-	decodeUpdate(update: WireServiceProviderUpdate): DecodedServiceProviderUpdate;
+	decodeSnapshot(snapshot: WireServiceSubscriptionSnapshot): ServiceSubscriptionSnapshot;
+	decodeUpdate(update: WireServiceProviderUpdate): ServiceProviderUpdate;
 }
 
 interface CodecEntry<C> {
@@ -123,7 +118,7 @@ export function createServiceStateDecoder(): ServiceStateDecoder {
 }
 
 function encodeInstance(
-	instance: DecodedServiceInstanceSnapshot,
+	instance: ServiceInstanceSnapshot,
 	codecs: StateCodecRegistry<Encoder>,
 ): WireServiceSubscriptionSnapshot["instances"][number] {
 	return {
@@ -139,7 +134,7 @@ function encodeInstance(
 function decodeInstance(
 	instance: WireServiceSubscriptionSnapshot["instances"][number],
 	codecs: StateCodecRegistry<Decoder>,
-): DecodedServiceInstanceSnapshot {
+): ServiceInstanceSnapshot {
 	return {
 		...instance,
 		members: instance.members.map((member) =>

@@ -1,16 +1,12 @@
-import type { ProtocolErrorCode, ServiceErrorCode } from "@earendil-works/pi-protocol";
+import type { RemoteServiceErrorCode } from "@earendil-works/chord";
 
 type ServerOperationErrorCode =
-	| ServiceErrorCode
-	| Extract<
-			ProtocolErrorCode,
-			| "wrong_server"
-			| "session_not_found"
-			| "session_ambiguous"
-			| "session_not_attached"
-			| "not_supported"
-			| "server_draining"
-	  >;
+	| RemoteServiceErrorCode
+	| "wrong_server"
+	| "session_not_found"
+	| "session_ambiguous"
+	| "session_not_attached"
+	| "server_draining";
 
 export const INTERNAL_SERVER_ERROR_MESSAGE = "Internal server error";
 
@@ -50,13 +46,6 @@ export class SessionNotAttachedError extends ServerError {
 	constructor() {
 		super("session_not_attached", "Session is not attached to this client");
 		this.name = "SessionNotAttachedError";
-	}
-}
-
-export class NotSupportedError extends ServerError {
-	constructor(message: string) {
-		super("not_supported", message);
-		this.name = "NotSupportedError";
 	}
 }
 
