@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +37,31 @@ test("keeps type-only and variable-specifier imports out of the graph", async (t
 	const graph = [...walk(join(root, "entry.ts"))];
 
 	assert.equal(graph.length, 1, "only the entry itself is reachable");
+});
+
+test("keeps typeof import type queries out of the graph regardless of whitespace", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "pi-entry-graphs-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	await writeFile(
+		join(root, "entry.ts"),
+		[
+			'export type Spaces = typeof   import("./spaces.ts");',
+			'export type Tab = typeof\timport("./tab.ts");',
+			'export type Newline = typeof\n\timport("./newline.ts");',
+			'export const value = import("./value.ts");',
+		].join("\n"),
+	);
+	await writeFile(join(root, "spaces.ts"), "export const erased = 1;\n");
+	await writeFile(join(root, "tab.ts"), "export const erased = 1;\n");
+	await writeFile(join(root, "newline.ts"), "export const erased = 1;\n");
+	await writeFile(join(root, "value.ts"), "export const bundled = 1;\n");
+
+	const graph = [...walk(join(root, "entry.ts"))];
+
+	assert.ok(graph.includes(join(root, "value.ts")), "a value dynamic import with normal spacing is followed");
+	assert.ok(!graph.includes(join(root, "spaces.ts")), "typeof import with several spaces stays type-only");
+	assert.ok(!graph.includes(join(root, "tab.ts")), "typeof import with a tab stays type-only");
+	assert.ok(!graph.includes(join(root, "newline.ts")), "typeof import across a newline stays type-only");
 });
 
 test("guards the published bun/cli entry but not the standalone-only entries", () => {

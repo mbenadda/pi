@@ -35,7 +35,10 @@ if (internalProcessRole === "coordinator") {
 		process.exit(1);
 	});
 } else if (internalProcessRole === "session-worker") {
-	void runSessionWorkerProcess(process.argv.slice(2)).catch(() => process.exit(1));
+	void runSessionWorkerProcess(process.argv.slice(2)).catch((error: unknown) => {
+		console.error(error);
+		process.exit(1);
+	});
 } else {
 	setupCli();
 	const args = process.argv.slice(2);

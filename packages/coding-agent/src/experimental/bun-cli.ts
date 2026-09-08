@@ -36,7 +36,10 @@ if (internalProcessRole === "coordinator") {
 		process.exit(1);
 	});
 } else if (internalProcessRole === "session-worker") {
-	void runSessionWorkerProcess(args).catch(() => process.exit(1));
+	void runSessionWorkerProcess(args).catch((error: unknown) => {
+		console.error(error);
+		process.exit(1);
+	});
 } else if (basename(process.execPath) === "pi-workspace-server" && args.length === 1) {
 	await runWorkspaceSshBridge(args);
 } else {

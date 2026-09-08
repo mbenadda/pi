@@ -82,6 +82,28 @@ export const SessionWorkerMetadataSchema = StrictObject({
 	legacyParentSessionPath: Type.Optional(Type.String()),
 });
 
+/**
+ * Compile-time coverage contract between a transport schema's static type and the domain
+ * metadata type. Key sets must match in both directions: `Required<TMetadata> extends
+ * Required<TSchema>` alone stays silent when the schema omits an optional key, because the
+ * extra required field stays assignable to the narrower required object. The final clause
+ * keeps required metadata field types compatible with the schema's declared types.
+ */
+export type AssertMetadataSchemaCovers<TSchema, TMetadata> = [keyof TMetadata] extends [keyof TSchema]
+	? [keyof TSchema] extends [keyof TMetadata]
+		? Required<TMetadata> extends Required<TSchema>
+			? true
+			: never
+		: never
+	: never;
+
+// The schema is strict (additionalProperties: false): a JsonlSessionMetadata field missing here
+// makes worker-boundary metadata fail validation, so coverage is asserted at compile time.
+const _sessionMetadataSchemaCoverage: AssertMetadataSchemaCovers<
+	Static<typeof SessionWorkerMetadataSchema>,
+	JsonlSessionMetadata
+> = true;
+
 export const SessionWorkerOptionsSchema = StrictObject({
 	sessionDir: Type.String({ minLength: 1 }),
 	metadata: SessionWorkerMetadataSchema,

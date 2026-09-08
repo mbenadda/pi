@@ -46,7 +46,9 @@ const BUDGETS = {
 };
 
 const SPEC = /(?:^|\n)\s*(?:import|export)\s+(?!type\s)([^;]*?\sfrom\s*)?["']([^"']+)["']/g;
-const DYNAMIC_SPEC = /(?<!typeof\s)\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
+// `\s+` in the lookbehind (not a single `\s`): TypeScript allows any whitespace run between
+// `typeof` and the query, so `typeof   import("./x.ts")` stays type-only and out of the graph.
+const DYNAMIC_SPEC = /(?<!typeof\s+)\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
 
 function resolveSpec(spec, fromFile) {
 	if (spec.startsWith("node:")) return null;

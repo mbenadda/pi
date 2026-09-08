@@ -1,10 +1,13 @@
 import type { ChildProcess } from "node:child_process";
 import { BACKGROUND_CONTEXT, type JsonlSessionMetadata } from "@earendil-works/pi-agent-core";
+import type { Static } from "typebox";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { CoordinatorConnectionEvent } from "../src/experimental/coordinator.ts";
 import {
+	type AssertMetadataSchemaCovers,
 	SESSION_WORKER_CONTROL_TOKEN_ENV,
 	SESSION_WORKER_PEER_ID_ENV,
+	type SessionWorkerMetadataSchema,
 	type SessionWorkerOptions,
 } from "../src/experimental/session-worker.ts";
 import { SessionWorkerManager } from "../src/experimental/session-worker-manager.ts";
@@ -107,5 +110,17 @@ describe("Session worker metadata boundary", () => {
 		expect(workers.trackedSessions).toHaveLength(1);
 		expect(workers.trackedSessions[0]?.legacyParentSessionPath).toBe("/tmp/legacy-parent.jsonl");
 		workers.detach();
+	});
+
+	test("schema coverage contract fails when the schema omits an optional metadata key", () => {
+		type SchemaMissingOptionalKey = Omit<Static<typeof SessionWorkerMetadataSchema>, "legacyParentSessionPath">;
+		// legacyParentSessionPath is a JsonlSessionMetadata key, so a schema missing it must fail
+		// AssertMetadataSchemaCovers. `Required<JsonlSessionMetadata> extends Required<Schema>` alone
+		// cannot catch this (extra required fields stay assignable), which is why the contract checks
+		// key sets in both directions. Weakening the contract so this fixture compiles turns the
+		// directive unused and fails npm run check.
+		// @ts-expect-error: the omission must not satisfy the coverage contract
+		const missingOptionalKey: AssertMetadataSchemaCovers<SchemaMissingOptionalKey, JsonlSessionMetadata> = true;
+		expect(missingOptionalKey).toBe(true);
 	});
 });
