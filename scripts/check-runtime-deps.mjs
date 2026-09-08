@@ -24,6 +24,9 @@ const STANDALONE_RUNTIME_TREES = new Map([
 	],
 ]);
 
+/** Workspace fork: coding-agent compiles the standalone-only trees through this extra config. */
+const STANDALONE_BUILD_CONFIGS = new Map([["@earendil-works/pi-coding-agent", "tsconfig.standalone.json"]]);
+
 function packageBase(specifier) {
 	return specifier.split("/").slice(0, specifier.startsWith("@") ? 2 : 1).join("/");
 }
@@ -89,27 +92,43 @@ for (const { directory } of getPublicWorkspacePackages()) {
 	const sourceDirectory = resolve(directory, "src");
 	if (!existsSync(sourceDirectory)) continue;
 	const manifest = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
-	const configPath = join(directory, "tsconfig.build.json");
-	const config = existsSync(configPath)
-		? ts.readConfigFile(configPath, ts.sys.readFile)
-		: { config: { include: ["src/**/*"] } };
-	if (config.error) throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, "\n"));
-	const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, resolve(directory));
-	if (parsed.errors.length > 0) {
-		throw new Error(parsed.errors.map((error) => ts.flattenDiagnosticMessageText(error.messageText, "\n")).join("\n"));
-	}
-	const roots = new Set(parsed.fileNames.map((file) => resolve(file)));
-	const program = ts.createProgram(parsed.fileNames, parsed.options);
-	for (const source of program.getSourceFiles()) {
-		if (source.isDeclarationFile || source.fileName.endsWith(".json")) continue;
-		const path = relative(sourceDirectory, resolve(source.fileName));
-		if (path.startsWith("..") || isAbsolute(path)) continue;
-		// TypeScript's exclude only filters roots: imports can pull excluded files
-		// back into the build. Reject that too, including type-only imports.
-		if (!roots.has(resolve(source.fileName))) {
-			failures.push(`${source.fileName} is excluded from ${manifest.name}'s build but imported by it`);
+	const buildConfig = join(directory, "tsconfig.build.json");
+	const configs = [
+		{ path: buildConfig, exists: existsSync(buildConfig), enforceRoots: true },
+	];
+	const standaloneConfig = STANDALONE_BUILD_CONFIGS.get(manifest.name);
+	if (standaloneConfig !== undefined) {
+		const path = join(directory, standaloneConfig);
+		if (!existsSync(path)) {
+			failures.push(`${manifest.name} is missing its standalone build config: ${standaloneConfig}`);
+		} else {
+			configs.push({ path, exists: true, enforceRoots: false });
 		}
-		checkSource(source, manifest, path.replaceAll("\\", "/"));
+	}
+	for (const config of configs) {
+		const loaded = config.exists
+			? ts.readConfigFile(config.path, ts.sys.readFile)
+			: { config: { include: ["src/**/*"] } };
+		if (loaded.error) throw new Error(ts.flattenDiagnosticMessageText(loaded.error.messageText, "\n"));
+		const parsed = ts.parseJsonConfigFileContent(loaded.config, ts.sys, resolve(directory));
+		if (parsed.errors.length > 0) {
+			throw new Error(parsed.errors.map((error) => ts.flattenDiagnosticMessageText(error.messageText, "\n")).join("\n"));
+		}
+		// TypeScript's exclude only filters roots: imports can pull excluded files
+		// back into the build. Reject that for the published build, including type-only
+		// imports. The standalone config intentionally roots only the standalone trees, so
+		// every other program file is there by import, not exclusion violation.
+		const roots = config.enforceRoots ? new Set(parsed.fileNames.map((file) => resolve(file))) : undefined;
+		const program = ts.createProgram(parsed.fileNames, parsed.options);
+		for (const source of program.getSourceFiles()) {
+			if (source.isDeclarationFile || source.fileName.endsWith(".json")) continue;
+			const path = relative(sourceDirectory, resolve(source.fileName));
+			if (path.startsWith("..") || isAbsolute(path)) continue;
+			if (roots !== undefined && !roots.has(resolve(source.fileName))) {
+				failures.push(`${source.fileName} is excluded from ${manifest.name}'s build but imported by it`);
+			}
+			checkSource(source, manifest, path.replaceAll("\\", "/"));
+		}
 	}
 }
 

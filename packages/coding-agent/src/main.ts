@@ -61,7 +61,6 @@ import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/setti
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
-import { runExperimentalCommand } from "./experimental/commands.ts";
 import { builtInExtensions } from "./extensions/index.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
@@ -570,11 +569,6 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	if (await runAuthCommand(args)) {
-		return;
-	}
-
-	if (await runExperimentalCommand(args)) {
-		if (args[0] === "client" || args[0] === "workspace") process.exit(process.exitCode ?? 0);
 		return;
 	}
 

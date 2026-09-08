@@ -298,7 +298,7 @@ describe("workspace remote paths and command construction", () => {
 			serverLogPath: `${HOME}/.local/state/pi-workspace-mvp/server.log`,
 			serverIdFile: `${HOME}/.local/state/pi-workspace-mvp/server/default-server-id`,
 			bridgePath: `${HOME}/.local/share/pi-workspace-mvp/${REVISION}/scripts/workspace-ssh-bridge.mjs`,
-			cliEntry: `${HOME}/.local/share/pi-workspace-mvp/${REVISION}/packages/coding-agent/dist/bundle/cli.js`,
+			cliEntry: `${HOME}/.local/share/pi-workspace-mvp/${REVISION}/packages/coding-agent/dist/experimental/standalone-cli.js`,
 			markerPath: `${HOME}/.local/share/pi-workspace-mvp/${REVISION}/.pi-workspace-staged`,
 			standalone: false,
 		});
@@ -843,7 +843,9 @@ describe("workspace remote paths and command construction", () => {
 	test("builds stop and purge commands that only touch MVP-owned paths", () => {
 		const built = paths();
 		expect(remoteCommands.stopServer(built)).toContain(`grep -qF ${built.shareRoot}/`);
-		expect(remoteCommands.stopServer(built)).toContain("/packages/coding-agent/dist/bundle/cli.js\\ server");
+		expect(remoteCommands.stopServer(built)).toContain(
+			"/packages/coding-agent/dist/experimental/standalone-cli.js\\ server",
+		);
 		expect(remoteCommands.stopServer(built)).toMatch(/printf %s stopped; else printf %s absent; fi/);
 		expect(remoteCommands.removeStaging(built)).toContain(
 			`if [ -f ${built.markerPath} ]; then rm -rf ${built.revisionDir}`,

@@ -12,7 +12,7 @@ afterEach(() => {
 	for (const directory of tempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-function runEntry(entry: string, experimental: boolean) {
+function runEntry(entry: string, experimental: boolean, env: NodeJS.ProcessEnv = {}) {
 	const directory = mkdtempSync(join(tmpdir(), "pi-cli-boundary-"));
 	tempDirs.push(directory);
 	return spawnSync(
@@ -37,25 +37,23 @@ function runEntry(entry: string, experimental: boolean) {
 				PI_CODING_AGENT_DIR: join(directory, "agent"),
 				PI_OFFLINE: "1",
 				PI_EXPERIMENTAL: experimental ? "1" : "0",
+				...env,
 			},
 		},
 	);
 }
 
-describe("stable and development CLI entrypoints", () => {
-	// #9132 keeps remote-server dependencies out of upstream's published CLI. This fork
-	// deliberately diverges: the standalone Workspace backend runs `pi server` from the
-	// stable bundle/binary behind PI_EXPERIMENTAL=1, so the stable entrypoint dispatches
-	// experimental commands when experiments are enabled. The published npm exports stay
-	// source-only (see packages/coding-agent/package.json).
-	it("dispatches experimental commands from the stable entrypoint when experiments are enabled", () => {
+describe("stable and standalone CLI entrypoints", () => {
+	// #9132: enabling experiments must not pull remote-server dependencies into the published CLI.
+	// The stable entrypoint never dispatches experimental commands; the standalone Workspace
+	// runtime dispatches them from its own unpublished entrypoints instead.
+	it("does not dispatch experimental commands from the stable entrypoint", () => {
 		const result = runEntry("cli.ts", true);
-		expect(result.status, result.stderr).toBe(1);
-		expect(result.stderr).toContain("Invalid --server-id");
-		expect(result.stdout).not.toContain(VERSION);
+		expect(result.status, result.stderr).toBe(0);
+		expect(result.stdout.trim()).toBe(VERSION);
 	});
 
-	it("falls back to the stable CLI when experiments are disabled", () => {
+	it("keeps the stable CLI behavior with experiments disabled", () => {
 		const result = runEntry("cli.ts", false);
 		expect(result.status, result.stderr).toBe(0);
 		expect(result.stdout.trim()).toBe(VERSION);
@@ -68,9 +66,34 @@ describe("stable and development CLI entrypoints", () => {
 		expect(result.stdout).not.toContain(VERSION);
 	});
 
-	it("falls back to the stable CLI when experiments are disabled", () => {
+	it("falls back to the stable CLI from the development entrypoint when experiments are disabled", () => {
 		const result = runEntry("experimental/cli.ts", false);
 		expect(result.status, result.stderr).toBe(0);
 		expect(result.stdout.trim()).toBe(VERSION);
+	});
+
+	it("dispatches experimental commands from the standalone entrypoint", () => {
+		const result = runEntry("experimental/standalone-cli.ts", true);
+		expect(result.status, result.stderr).toBe(1);
+		expect(result.stderr).toContain("Invalid --server-id");
+		expect(result.stdout).not.toContain(VERSION);
+	});
+
+	it("falls back to the stable CLI from the standalone entrypoint when experiments are disabled", () => {
+		const result = runEntry("experimental/standalone-cli.ts", false);
+		expect(result.status, result.stderr).toBe(0);
+		expect(result.stdout.trim()).toBe(VERSION);
+	});
+
+	it("routes internal process roles through the standalone entrypoint", () => {
+		const result = runEntry("experimental/standalone-cli.ts", true, { __PI_INTERNAL_SPAWN: "server" });
+		expect(result.status, result.stderr).not.toBe(0);
+		expect(result.stderr).toContain("Internal server requires an absolute server directory");
+	});
+
+	it("rejects an unsupported internal process role", () => {
+		const result = runEntry("experimental/standalone-cli.ts", true, { __PI_INTERNAL_SPAWN: "bogus" });
+		expect(result.status, result.stderr).not.toBe(0);
+		expect(result.stderr).toContain("Unsupported internal process role: bogus");
 	});
 });

@@ -84,8 +84,10 @@ export async function terminateInternalProcess(child: ChildProcess): Promise<voi
 function defaultEntryUrl(role: InternalProcessRole, override: URL | undefined): URL {
 	if (override) return override;
 	if (isBundledNode) {
-		const entry = role === "coordinator" ? "coordinator.js" : "cli.js";
-		return pathToFileURL(join(getPackageDir(), "dist", "bundle", entry));
+		// The published stable bundle never ships the experimental role entrypoints. A bundled
+		// Workspace runtime therefore re-enters through the standalone CLI, which dispatches
+		// internal roles before the stable CLI (see experimental/standalone-cli.ts).
+		return pathToFileURL(join(getPackageDir(), "dist", "experimental", "standalone-cli.js"));
 	}
 	const javaScript = import.meta.url.endsWith(".js");
 	if (role === "coordinator") {

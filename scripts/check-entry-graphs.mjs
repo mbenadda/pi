@@ -65,7 +65,7 @@ function resolveSpec(spec, fromFile) {
 	return null; // external dependency: not part of the workspace graph
 }
 
-function walk(entryFile) {
+export function walk(entryFile) {
 	const seen = new Set();
 	const queue = [entryFile];
 	while (queue.length > 0) {
@@ -97,6 +97,33 @@ function expand(pkgDir, entry, target) {
 }
 
 let failures = 0;
+
+// Workspace fork: the published coding-agent entrypoints (the `pi` bin bundles dist/cli.js,
+// which compiles from src/cli.ts) must never reach the standalone-only trees. Those compile
+// through tsconfig.standalone.json into output the npm tarball excludes.
+const CODING_AGENT_PUBLIC_ENTRIES = ["src/index.ts", "src/cli.ts", "src/rpc-entry.ts"];
+const CODING_AGENT_STANDALONE_TREES = ["src/client/", "src/experimental/", "src/cli/experimental/"];
+
+function checkCodingAgentPublicEntries() {
+	for (const entry of CODING_AGENT_PUBLIC_ENTRIES) {
+		const file = resolve(ROOT, "packages/coding-agent", entry);
+		if (!existsSync(file)) {
+			console.error(`packages/coding-agent public entry ${entry} is missing`);
+			failures += 1;
+			continue;
+		}
+		const graph = [...walk(file)].map((reached) => relative(ROOT, reached).replaceAll("\\", "/"));
+		for (const tree of CODING_AGENT_STANDALONE_TREES) {
+			const hits = graph.filter((path) => path.includes(tree));
+			if (hits.length > 0) {
+				console.error(`${entry} must not reach ${tree}:\n${hits.map((hit) => `    ${hit}`).join("\n")}`);
+				failures += 1;
+			}
+		}
+	}
+}
+
+function main() {
 for (const [pkgDir, budgets] of Object.entries(BUDGETS)) {
 	const manifest = JSON.parse(readFileSync(resolve(ROOT, pkgDir, "package.json"), "utf8"));
 	for (const [entry, budget] of Object.entries(budgets)) {
@@ -132,9 +159,14 @@ for (const [pkgDir, budgets] of Object.entries(BUDGETS)) {
 		}
 	}
 }
+checkCodingAgentPublicEntries();
 
 if (failures > 0) {
 	console.error(`\n${failures} entry-point budget violation(s).`);
 	process.exit(1);
 }
 console.log("Entry point graphs are within budget.");
+}
+
+const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) main();

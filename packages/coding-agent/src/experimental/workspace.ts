@@ -121,7 +121,7 @@ export function buildWorkspaceRemotePaths(home: string, revision: string): Works
 		serverLogPath: `${stateRoot}/server.log`,
 		serverIdFile: `${serverDir}/default-server-id`,
 		bridgePath: `${revisionDir}/scripts/workspace-ssh-bridge.mjs`,
-		cliEntry: `${revisionDir}/packages/coding-agent/dist/bundle/cli.js`,
+		cliEntry: `${revisionDir}/packages/coding-agent/dist/experimental/standalone-cli.js`,
 		markerPath: `${revisionDir}/.pi-workspace-staged`,
 		standalone: false,
 	};
@@ -676,7 +676,7 @@ export const remoteCommands = {
 		return (
 			`pid=$(cat ${pidFile} 2>/dev/null || true); cmd=$(tr "\\0" " " < /proc/$pid/cmdline 2>/dev/null || true)` +
 			`; if [ -n "$pid" ] && printf %s "$cmd" | grep -qF ${shareRoot}/` +
-			` && printf %s "$cmd" | grep -qF ${paths.standalone ? "/bin/pi-workspace-server\\ server" : "/packages/coding-agent/dist/bundle/cli.js\\ server"}` +
+			` && printf %s "$cmd" | grep -qF ${paths.standalone ? "/bin/pi-workspace-server\\ server" : "/packages/coding-agent/dist/experimental/standalone-cli.js\\ server"}` +
 			`; then kill -TERM "$pid"; printf %s stopped; else printf %s absent; fi` +
 			`; rm -f ${pidFile} ${revisionFile}`
 		);

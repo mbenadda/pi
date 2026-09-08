@@ -107,8 +107,9 @@ async function runWorkspaceCommand(command: WorkspaceCommand): Promise<void> {
  * Dispatch for the experimental server, client, and workspace commands.
  *
  * Upstream keeps this behind the development entrypoint only; the standalone Workspace
- * runtime also dispatches it from the packaged CLI because the pinned backend runs
- * `pi server` / `pi-workspace-server server` from the stable bundle.
+ * runtime also dispatches it from its own entrypoints (experimental/standalone-cli.ts and
+ * experimental/bun-cli.ts, both excluded from the published package) because the pinned
+ * backend runs `pi server` / `pi-workspace-server server` from the standalone build.
  */
 export async function runExperimentalCommand(args: string[]): Promise<boolean> {
 	if (!areExperimentalFeaturesEnabled() || (args[0] !== "server" && args[0] !== "client" && args[0] !== "workspace")) {

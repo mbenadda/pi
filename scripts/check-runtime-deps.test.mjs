@@ -86,6 +86,9 @@ test("allows standalone runtime trees to import development-only workspace packa
 		devDependencies: { "@earendil-works/pi-client": "1.0.0", "@earendil-works/pi-protocol": "1.0.0" },
 	};
 	const trees = {
+		"packages/example/tsconfig.standalone.json": JSON.stringify({
+			include: ["src/client/**/*.ts", "src/experimental/**/*.ts", "src/cli/experimental/**/*.ts"],
+		}),
 		"packages/example/src/experimental/piw.ts": 'import { isValidSshHost } from "@earendil-works/pi-client/ssh";',
 		"packages/example/src/client/index.ts": 'import type { JsonValue } from "@earendil-works/pi-protocol";',
 		"packages/example/src/cli/experimental/commands/workspace.ts":
